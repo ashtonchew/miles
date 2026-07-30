@@ -1,0 +1,234 @@
+from tests.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-cpu", labels=[])
+
+import asyncio
+from argparse import Namespace
+from typing import cast
+
+import pytest
+
+import miles.rollout.inference_rollout.fully_async as fully_async_module
+from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.rollout.data_source import SourceReservation, SourceReservationId
+from miles.rollout.fully_async.execution import (
+    FullyAsyncExecutionFailure,
+    FullyAsyncExecutionRetry,
+    FullyAsyncExecutionSuccess,
+    FullyAsyncRetryReason,
+)
+from miles.rollout.fully_async.ownership import ReservationExecutorReceipt
+from miles.rollout.inference_rollout.fully_async import InferenceFullyAsyncExecutor
+from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
+from miles.utils.types import Sample
+
+
+def make_generate_state() -> GenerateState:
+    async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+        sample = cast(Sample, input.sample)
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = 1.0
+        return GenerateFnOutput(samples=sample)
+
+    state = GenerateState.__new__(GenerateState)
+    state.args = Namespace(
+        group_rm=False,
+        mask_offpolicy_in_partial_rollout=False,
+        partial_rollout=False,
+        rollout_health_check_timeout=0.1,
+        sglang_enable_deterministic_inference=False,
+        sglang_router_policy="random",
+    )
+    state.generate_fn_semaphore = asyncio.Semaphore(1)
+    state.sampling_params = {}
+    state.generate_function = generate
+    state.aborted = False
+    return state
+
+
+async def test_executor_returns_receipt_bound_success_without_mutating_reservation() -> None:
+    executor = InferenceFullyAsyncExecutor(make_generate_state())
+    reservation = SourceReservation(
+        reservation_id=SourceReservationId("source-0"),
+        samples=(Sample(group_index=0, index=0, prompt="prompt"),),
+    )
+    executor_receipt = cast(ReservationExecutorReceipt, object())
+
+    execution = executor.submit(reservation, executor_receipt)
+    outcome = await execution.wait_terminal()
+
+    assert outcome == FullyAsyncExecutionSuccess(
+        executor_receipt=executor_receipt,
+        samples=[
+            Sample(
+                group_index=0,
+                index=0,
+                prompt="prompt",
+                reward=1.0,
+                status=Sample.Status.COMPLETED,
+            )
+        ],
+    )
+    assert reservation == SourceReservation(
+        reservation_id=SourceReservationId("source-0"),
+        samples=(Sample(group_index=0, index=0, prompt="prompt"),),
+    )
+
+    await executor.close()
+
+
+async def test_executor_retries_terminal_abort_without_mutating_reservation() -> None:
+    state = make_generate_state()
+
+    async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+        sample = cast(Sample, input.sample)
+        sample.response = "discarded"
+        sample.status = Sample.Status.ABORTED
+        return GenerateFnOutput(samples=sample)
+
+    state.generate_function = generate
+    executor = InferenceFullyAsyncExecutor(state)
+    reservation = SourceReservation(
+        reservation_id=SourceReservationId("source-1"),
+        samples=(Sample(group_index=1, index=10, prompt="prompt"),),
+    )
+    executor_receipt = cast(ReservationExecutorReceipt, object())
+
+    execution = executor.submit(reservation, executor_receipt)
+    outcome = await execution.wait_terminal()
+
+    assert outcome == FullyAsyncExecutionRetry(
+        executor_receipt=executor_receipt,
+        reason=FullyAsyncRetryReason.EXECUTION_ABORTED,
+    )
+    assert reservation == SourceReservation(
+        reservation_id=SourceReservationId("source-1"),
+        samples=(Sample(group_index=1, index=10, prompt="prompt"),),
+    )
+
+    await executor.close()
+
+
+async def test_executor_returns_receipt_bound_failure_for_unknown_status() -> None:
+    state = make_generate_state()
+
+    async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+        sample = cast(Sample, input.sample)
+        sample.status = cast(Sample.Status, None)
+        sample.reward = 0.0
+        return GenerateFnOutput(samples=sample)
+
+    state.generate_function = generate
+    executor = InferenceFullyAsyncExecutor(state)
+    reservation = SourceReservation(
+        reservation_id=SourceReservationId("source-invalid"),
+        samples=(Sample(group_index=2, index=20, prompt="prompt"),),
+    )
+    executor_receipt = cast(ReservationExecutorReceipt, object())
+
+    execution = executor.submit(reservation, executor_receipt)
+    outcome = await execution.wait_terminal()
+
+    assert isinstance(outcome, FullyAsyncExecutionFailure)
+    assert outcome.executor_receipt is executor_receipt
+    assert type(outcome.error) is ValueError
+    assert str(outcome.error) == "Fully async inference returned sample 20 with unsupported status None."
+
+    await executor.close()
+
+
+@pytest.mark.parametrize(
+    "generated_samples",
+    [
+        cast(list[Sample | list[Sample]], [None]),
+        cast(list[Sample | list[Sample]], [[None]]),
+    ],
+    ids=["top-level", "nested"],
+)
+async def test_executor_returns_receipt_bound_failure_for_non_sample_output(
+    monkeypatch: pytest.MonkeyPatch,
+    generated_samples: list[Sample | list[Sample]],
+) -> None:
+    async def generate_and_rm_group(state, samples, sampling_params, evaluation=False):
+        return generated_samples
+
+    monkeypatch.setattr(fully_async_module, "generate_and_rm_group", generate_and_rm_group)
+    executor = InferenceFullyAsyncExecutor(make_generate_state())
+    reservation = SourceReservation(
+        reservation_id=SourceReservationId("source-malformed"),
+        samples=(Sample(group_index=3, index=30, prompt="prompt"),),
+    )
+    executor_receipt = cast(ReservationExecutorReceipt, object())
+
+    execution = executor.submit(reservation, executor_receipt)
+    outcome = await execution.wait_terminal()
+
+    assert isinstance(outcome, FullyAsyncExecutionFailure)
+    assert outcome.executor_receipt is executor_receipt
+    assert type(outcome.error) is ValueError
+    assert str(outcome.error) == "Fully async inference returned non-Sample values at parent slot 0."
+
+    await executor.close()
+
+
+async def test_executor_close_settles_siblings_before_raising_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executions_started = 0
+    all_started = asyncio.Event()
+    release_failure = asyncio.Event()
+    failure_raised = asyncio.Event()
+    release_sibling = asyncio.Event()
+    sibling_finished = asyncio.Event()
+    failure = RuntimeError("executor task failed")
+
+    async def generate_and_rm_group(state, samples, sampling_params, evaluation=False):
+        nonlocal executions_started
+        executions_started += 1
+        if executions_started == 2:
+            all_started.set()
+        if samples[0].index == 40:
+            await release_failure.wait()
+            failure_raised.set()
+            raise failure
+        await release_sibling.wait()
+        sibling_finished.set()
+        return samples
+
+    monkeypatch.setattr(fully_async_module, "generate_and_rm_group", generate_and_rm_group)
+    executor = InferenceFullyAsyncExecutor(make_generate_state())
+    first_execution = executor.submit(
+        SourceReservation(
+            reservation_id=SourceReservationId("source-4"),
+            samples=(Sample(group_index=4, index=40, prompt="prompt"),),
+        ),
+        cast(ReservationExecutorReceipt, object()),
+    )
+    second_execution = executor.submit(
+        SourceReservation(
+            reservation_id=SourceReservationId("source-5"),
+            samples=(Sample(group_index=5, index=50, prompt="prompt"),),
+        ),
+        cast(ReservationExecutorReceipt, object()),
+    )
+    first_task = cast(fully_async_module._InferenceFullyAsyncExecution, first_execution)._task
+    second_task = cast(fully_async_module._InferenceFullyAsyncExecution, second_execution)._task
+    monkeypatch.setattr(executor, "_tasks", [first_task, second_task])
+    close = asyncio.create_task(executor.close())
+    await all_started.wait()
+
+    try:
+        release_failure.set()
+        await failure_raised.wait()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(close), timeout=0.01)
+        assert not sibling_finished.is_set()
+    finally:
+        release_sibling.set()
+        await asyncio.gather(close, return_exceptions=True)
+
+    with pytest.raises(RuntimeError) as error:
+        await close
+
+    assert error.value is failure
+    assert sibling_finished.is_set()
