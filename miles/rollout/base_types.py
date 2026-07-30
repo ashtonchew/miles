@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from argparse import Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 from miles.rollout.data_source import DataSource
@@ -46,18 +48,92 @@ class RolloutFnEvalInput(RolloutFnBaseInput):
         return True
 
 
+class TrainBatchRollbackReason(Enum):
+    """Reason that a manager could not hand a leased batch to training."""
+
+    HANDOFF_FAILED = auto()
+
+
+class TrainBatchLease(ABC):
+    """Own a rollout batch until its train-data handoff settles.
+
+    Args:
+        rollout_id: Training rollout that requested the batch.
+
+    A successful commit transfers ownership to downstream train data.
+    Settlement may be attempted only once, including when its implementation
+    raises.
+    """
+
+    def __init__(self, rollout_id: int) -> None:
+        self._rollout_id = rollout_id
+        self._settlement_attempted = False
+
+    @property
+    def rollout_id(self) -> int:
+        """Return the rollout that acquired this batch."""
+        return self._rollout_id
+
+    def commit(self) -> None:
+        """Transfer batch ownership to downstream train data.
+
+        Raises:
+            RuntimeError: If any settlement was already attempted.
+        """
+        self._claim_settlement()
+        self._commit()
+
+    @abstractmethod
+    def _commit(self) -> None:
+        """Implement the ownership transfer after settlement is claimed."""
+
+    def rollback(self, reason: TrainBatchRollbackReason) -> None:
+        """Return ownership after a train-data handoff fails.
+
+        Args:
+            reason: Why the manager could not complete the handoff.
+
+        Raises:
+            RuntimeError: If any settlement was already attempted.
+        """
+        self._claim_settlement()
+        self._rollback(reason)
+
+    @abstractmethod
+    def _rollback(self, reason: TrainBatchRollbackReason) -> None:
+        """Implement ownership recovery after settlement is claimed."""
+
+    def _claim_settlement(self) -> None:
+        if self._settlement_attempted:
+            raise RuntimeError(f"Train batch lease for rollout {self.rollout_id} already has a settlement attempt.")
+        self._settlement_attempted = True
+
+
 # TODO make it frozen
 @dataclass
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
-    metrics: dict[str, Any] = None
+    metrics: dict[str, Any] | None = None
+
+
+@dataclass
+class LeasedRolloutFnTrainOutput(RolloutFnTrainOutput):
+    """Carry ordinary train output data with its required settlement lease.
+
+    Args:
+        samples: Generated samples grouped by source prompt.
+        metrics: Optional rollout metrics.
+        lease: Ownership to settle after the train-data handoff.
+    """
+
+    lease: TrainBatchLease = field(kw_only=True)
 
 
 # TODO make it frozen
 @dataclass
 class RolloutFnEvalOutput:
     data: dict[str, dict[str, Any]]
-    metrics: dict[str, Any] = None
+    metrics: dict[str, Any] | None = None
 
 
 RolloutFnInput = RolloutFnTrainInput | RolloutFnEvalInput
