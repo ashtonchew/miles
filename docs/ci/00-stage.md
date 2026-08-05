@@ -49,13 +49,15 @@ A **nightly** policy selects every enabled tag except `long` and `ft-long`, admi
 
 **Dependencies / gating.** Both CPU stages require both resolvers. GPU stages also require both resolvers and, by default, a successful `stage-a-cpu`, so a CPU-test failure short-circuits the expensive GPU fleet. Resolved nightly cadence and the `bypass-fastfail` PR label relax only the `stage-a-cpu` failure gate and make each suite continue after a test failure; neither bypasses resolver failure.
 
-**Runner selection.** GPU stages request runners by label via `runs_on`, a JSON list passed through to `runs-on` — a runner must carry **all** listed labels (GPU class + count). CPU stages set `cpu_runner: true` and run on GitHub-hosted `ubuntu-latest` instead, so they don't occupy GPU-fleet slots.
+**Runner selection.** GPU stages request runners by label via `runs_on`, a JSON list passed through to `runs-on` — a runner must carry **all** listed labels (GPU class + count). CPU stages call `_run-cpu-ci.yml`, whose only job runs on GitHub-hosted `ubuntu-latest`, so they don't occupy GPU-fleet slots.
 
 **Dependency boundary.** GPU stages start from dependencies baked into `radixark/miles`, reconcile Miles runtime dependencies from `requirements.txt`, update the SGLang and Megatron-LM checkouts to the selected refs, and expose all three source trees through `PYTHONPATH`; they do not rebuild or install the Miles, SGLang, or Megatron-LM source trees after the container starts. The hosted CPU stages install dependencies from `requirements.txt` and the fully pinned `tests/ci/requirements-ci-cpu.txt`, then expose the Miles, SGLang, and Megatron-LM source trees through `PYTHONPATH` without editable installs or inline package lists.
 
-**Launch.** Every stage is a thin caller of the reusable workflow `_run-ci.yml` (`uses: ./.github/workflows/_run-ci.yml`). The stage passes only `execute_command`, `runs_on`, `container_image`, and `cpu_runner`; `_run-ci.yml` owns the rest — starting the container, waiting for the GPU to be ready, reconciling Miles requirements and synchronizing external source refs for GPU jobs or installing the hosted CPU requirements, verifying source resolution, then running `execute_command` twice (once `--list-only` to print the plan, then for real). The stage itself holds no test logic; it is purely "which runner, which image, which command".
+**Launch.** Each stage is a thin caller of one hardware-specific reusable workflow: CPU stages use `_run-cpu-ci.yml`, while GPU stages use `_run-ci.yml`. Each reusable workflow declares only its matching job, so GitHub does not add a skipped CPU sibling to GPU stages or a skipped GPU sibling to CPU stages.
 
-**Secrets.** Stages call the reusable workflow with `secrets: inherit`, so `_run-ci.yml` receives the caller's secrets (e.g. `WANDB_API_KEY`) without re-declaring each one.
+Both workflows receive `execute_command`; GPU callers additionally pass `runs_on` and `container_image`. The reusable workflows own runner setup, dependency and source resolution, and the two command invocations (first `--list-only`, then the real run); each stage owns only which runner class, image, and command to select.
+
+**Secrets.** Stages call their reusable workflow with `secrets: inherit`, so both workflows receive the caller's secrets (e.g. `WANDB_API_KEY`) without re-declaring each one.
 
 **Sharding.** A stage with a `partition_id` matrix splits its tests across N shards; `run_suite.py` balances the shards by each test's `est_time`. Each shard is an independent job instance running the same `execute_command` with a different `--auto-partition-id`.
 
