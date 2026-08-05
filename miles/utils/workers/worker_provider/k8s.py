@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miles.utils.workers.naming import compute_worker_name, parse_cell_id
 from miles.utils.workers.reconcile.k8s_reflector import KubernetesReflector
@@ -27,6 +27,9 @@ from miles.utils.workers.worker_spec import (
     SpecMetaFn,
     WorkerMetaContext,
 )
+
+if TYPE_CHECKING:
+    from miles.utils.workers.colocate_matching import GpuPlacement
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,24 @@ class K8sWorkerProvider(BaseWorkerProvider):
 
     def pod_names(self, cell_id: str) -> list[str]:
         return [pod.name for pod in self._pods_of(cell_id)]
+
+    def gpu_placements(self, cell_id: str) -> list[GpuPlacement]:
+        from miles.utils.workers.colocate_matching import GpuPlacement
+
+        placements = []
+        for pod in sorted(self._loop_or_fail().get_by_parent(cell_id), key=_worker_index_of):
+            observed = observe_pod(pod, self._label_keys)
+            if observed is None:
+                continue
+            assert observed.node_name, f"{observed.name} is not scheduled yet"
+            placements.append(
+                GpuPlacement(
+                    worker_name=observed.name,
+                    node_name=observed.node_name,
+                    gpu_ids=observed.gpu_ids,
+                )
+            )
+        return placements
 
     def cell_ids(self) -> list[str]:
         return sorted(key for key in self._loop_or_fail().parent_keys() if not key.startswith(_NOT_A_WORKER_PREFIX))

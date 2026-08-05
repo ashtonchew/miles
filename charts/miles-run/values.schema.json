@@ -139,7 +139,25 @@
           }
         },
         "inferenceEngines": {"type": "array", "items": {"$ref": "#/definitions/fleet"}},
-        "trainers": {"type": "array", "items": {"$ref": "#/definitions/fleet"}}
+        "trainers": {"type": "array", "items": {"$ref": "#/definitions/fleet"}},
+        "colocate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "engineFleet": {"type": "string"},
+            "trainerFleet": {"type": "string"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+              "then": {
+                "required": ["engineFleet", "trainerFleet"],
+                "properties": {"engineFleet": {"minLength": 1}, "trainerFleet": {"minLength": 1}}
+              }
+            }
+          ]
+        }
       }
     },
     "adhoc": {

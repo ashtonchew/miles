@@ -54,6 +54,9 @@ UPPER_LAYER_EXEMPTIONS = {
     "miles/utils/workers/reconcile/k8s_api.py": "the kubernetes client the observing provider is written against",
     "miles/utils/arguments.py": "declares the --cluster-backend flag the composition roots read",
     "miles/utils/tracking_utils/base.py": "the prometheus collector is a ray actor and has no kubernetes form",
+    "miles/backends/sglang_utils/sglang_config.py": (
+        "reads the colocated fleet a kubernetes run declares, and falls back to the gpu ranges ray packs by"
+    ),
 }
 
 

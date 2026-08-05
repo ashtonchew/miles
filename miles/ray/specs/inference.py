@@ -4,7 +4,12 @@ import shlex
 import sys
 
 from miles.backends.sglang_utils.router_args_utils import compute_sglang_router_args, router_args_to_argv
-from miles.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, resolve_sglang_config
+from miles.backends.sglang_utils.sglang_config import (
+    ModelConfig,
+    ServerGroupConfig,
+    compute_engine_spec_name,
+    resolve_sglang_config,
+)
 from miles.backends.sglang_utils.sglang_engine import compute_engine_launch_cmd
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from miles.rollout.session.config import compute_session_server_config
@@ -177,10 +182,6 @@ def compute_session_server_instance_id(args, instance_index: int) -> str:
     return f"{args.run_uuid}-{instance_index}"
 
 
-def compute_engine_spec_name(model_idx: int, group_index: int) -> str:
-    return f"inference-engine-{model_idx}-{group_index}"
-
-
 def specs_inference_engine(args) -> list[CommandWorkerSpec]:
     if args.debug_train_only:
         return []
@@ -194,6 +195,7 @@ def specs_inference_engine(args) -> list[CommandWorkerSpec]:
             group_index=group_index,
             model_cfg=model_cfg,
             server_group_config=server_group_config,
+            colocate_with_trainer=server_group_config.colocated_with_trainer,
         )
         for model_idx, model_cfg in enumerate(config.models)
         for group_index, server_group_config in enumerate(model_cfg.server_groups)
@@ -211,6 +213,7 @@ def _compute_spec_inference_engine(
     group_index: int,
     model_cfg: ModelConfig,
     server_group_config: ServerGroupConfig,
+    colocate_with_trainer: bool,
 ) -> CommandWorkerSpec:
     def _compute_launch_command(ctx: LaunchCommandContext) -> str:
         dist_init = ctx.self_addrs["dist_init"]
@@ -240,6 +243,7 @@ def _compute_spec_inference_engine(
         num_gpu_slots_per_worker=min(server_group_config.num_gpus_per_engine, args.num_gpus_per_node),
         pg_name="rollout",
         pg_slot_offset=server_group_config.gpu_offset,
+        colocate_with_trainer=colocate_with_trainer,
     )
 
     num_workers_total = server_group_config.num_gpus // scheduling.num_gpu_slots_per_worker

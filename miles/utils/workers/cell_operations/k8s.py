@@ -15,10 +15,12 @@ class K8sCellOperations(BaseCellOperations):
         provider: SharedK8sWorkerProvider,
         spec_names: list[str],
         delete_pods: Callable[[list[str]], Awaitable[None]],
+        colocated_with: Callable[[str], list[str]] | None = None,
     ) -> None:
         self._provider = provider
         self._spec_names = spec_names
         self._delete_pods = delete_pods
+        self._colocated_with = colocated_with
         self._stop_watch: StopWatchFn | None = None
 
     async def cell_infos(self, *, spec_names: list[str]) -> dict[str, CellInfo]:
@@ -34,6 +36,8 @@ class K8sCellOperations(BaseCellOperations):
         pods = self._provider.pod_names(cell_id)
         assert pods, f"cannot suspend {cell_id}, which has no pods"
 
+        if self._colocated_with is not None:
+            pods = pods + self._colocated_with(cell_id)
         await self._delete_pods(pods)
 
     async def resume(self, *, cell_id: str) -> None:

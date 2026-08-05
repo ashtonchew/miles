@@ -69,6 +69,9 @@ class SharedK8sWorkerProvider(BaseWorkerProvider):
     def pod_names(self, cell_id: str) -> list[str]:
         return self._inner.pod_names(cell_id)
 
+    def gpu_placements(self, cell_id: str) -> list:
+        return self._inner.gpu_placements(cell_id)
+
     async def _fan_out(self, cell_id: str, info: CellInfo | None) -> None:
         if info is not None:
             self._spec_name_by_cell[cell_id] = info.spec_name

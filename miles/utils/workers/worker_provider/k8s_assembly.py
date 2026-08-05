@@ -32,6 +32,7 @@ def install_kubernetes_workers(
     delete_pods: Callable[[list[str]], Awaitable[None]],
     num_gpus_per_node: int = DEFAULT_GPUS_PER_NODE,
     label_keys: CellLabelKeys | None = None,
+    colocated_with: Callable[[str], list[str]] | None = None,
 ) -> KubernetesBackendCapability:
     watched_spec_names = fleet_spec_names(specs=specs)
     provider = SharedK8sWorkerProvider(
@@ -57,5 +58,6 @@ def install_kubernetes_workers(
             provider=provider,
             spec_names=watched_spec_names,
             delete_pods=delete_pods,
+            colocated_with=colocated_with,
         ),
     )
