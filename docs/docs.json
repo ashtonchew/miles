@@ -260,6 +260,7 @@
        "developer/migration",
        "developer/architecture",
        "developer/reconcile-loop",
+       "developer/worker-providers",
        "developer/experimental-features"
       ]
      }

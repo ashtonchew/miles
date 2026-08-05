@@ -26,7 +26,7 @@ def kubernetes_availability() -> BackendAvailability:
     if not (namespace := os.environ.get(NAMESPACE_ENV_VAR)):
         return BackendAvailability(
             False,
-            f"set {NAMESPACE_ENV_VAR} to a namespace of your own, so a run never lands in someone else's",
+            f"set {NAMESPACE_ENV_VAR} to a namespace of your own; see docs/developer/kubernetes-e2e.md",
         )
 
     reachable = subprocess.run(["kubectl", "get", "--raw", "/version"], capture_output=True, text=True)

@@ -9,7 +9,7 @@ class TestKubernetesAvailability:
 
         assert "kubectl" in cluster_backends.kubernetes_availability().reason
 
-    def test_asks_for_a_namespace_of_your_own_when_none_is_set(self, monkeypatch):
+    def test_points_at_the_runbook_when_no_namespace_is_set(self, monkeypatch):
         """Running in whatever namespace happened to be current is how someone else's run gets deleted."""
         monkeypatch.setattr(cluster_backends.shutil, "which", lambda name: f"/usr/bin/{name}")
         monkeypatch.delenv(cluster_backends.NAMESPACE_ENV_VAR, raising=False)
@@ -17,7 +17,7 @@ class TestKubernetesAvailability:
         reason = cluster_backends.kubernetes_availability().reason
 
         assert cluster_backends.NAMESPACE_ENV_VAR in reason
-        assert "your own" in reason
+        assert "kubernetes-e2e" in reason
 
     def test_reports_what_the_cluster_said_when_it_refuses(self, monkeypatch):
         """An expired token and a missing cluster look identical unless the message is passed through."""
