@@ -1,0 +1,5 @@
+{{- $context := . }}
+{{- range $trainer := .Values.run.trainers }}
+---
+{{ include "miles-run.fleet" (dict "context" $context "fleet" (merge (dict "containerName" "trainer") $trainer)) }}
+{{- end }}

@@ -1,0 +1,5 @@
+{{- $context := . }}
+{{- range $engine := .Values.run.inferenceEngines }}
+---
+{{ include "miles-run.fleet" (dict "context" $context "fleet" (merge (dict "containerName" "engine") $engine)) }}
+{{- end }}
