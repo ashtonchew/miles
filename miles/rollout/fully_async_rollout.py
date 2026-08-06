@@ -380,22 +380,40 @@ class _CachedWeightVersion:
         self._ttl = ttl
         self._value: int | None = None
         self._last_query = float("-inf")
+        self._query_lock = asyncio.Lock()
+
+    async def _query(self, args) -> int:
+        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/model_info"
+        data = await asyncio.wait_for(get(url), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
+        return int(data["weight_version"])
 
     async def get(self, args) -> int | None:
         # Throttles failures too: the drain queries once per group, and an unreachable
         # router would otherwise cost every one of them the full timeout.
         if (time.monotonic() - self._last_query) < self._ttl:
             return self._value
-        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/model_info"
-        try:
-            data = await asyncio.wait_for(get(url), timeout=WEIGHT_VERSION_QUERY_TIMEOUT_SECS)
-            self._value = int(data["weight_version"])
-        except (httpx.HTTPError, asyncio.TimeoutError) as e:
-            # Transient router unavailability; the staleness filter is best-effort.
-            logger.debug(f"Failed to query engine weight version: {e}")
-        finally:
-            # Stamped on completion, so a router slower than the TTL still gets throttled.
-            self._last_query = time.monotonic()
+        async with self._query_lock:
+            if (time.monotonic() - self._last_query) < self._ttl:
+                return self._value
+            try:
+                self._value = await self._query(args)
+            except (httpx.HTTPError, asyncio.TimeoutError) as e:
+                # Transient router unavailability; the staleness filter is best-effort.
+                logger.debug(f"Failed to query engine weight version: {e}")
+            finally:
+                # Stamped on completion, so a router slower than the TTL still gets throttled.
+                self._last_query = time.monotonic()
+        return self._value
+
+    async def refresh(self, args) -> int | None:
+        """Require a fresh router value without falling back to the cached version."""
+        async with self._query_lock:
+            self._last_query = -self._ttl
+            self._value = None
+            try:
+                self._value = await self._query(args)
+            finally:
+                self._last_query = time.monotonic()
         return self._value
 
 
@@ -434,6 +452,12 @@ class FullyAsyncRolloutFn:
         self._output: DataBuffer | None = None
         self._train_admission_open = asyncio.Event()
         self._train_admission_open.set()
+        self._train_batch_lease_admission_open = asyncio.Event()
+        self._train_batch_lease_admission_open.set()
+        self._train_admission_epoch = 0
+        self._strict_weight_version_epoch: int | None = None
+        self._strict_weight_version: int | None = None
+        self._strict_weight_version_lock = asyncio.Lock()
         self._train_admission_holds: set[_OwnedTrainAdmissionHold] = set()
         execution_samples = getattr(self.args, "fully_async_max_execution_samples", None)
         retained_groups = getattr(self.args, "fully_async_max_retained_groups", None)
@@ -501,10 +525,12 @@ class FullyAsyncRolloutFn:
             self._active_drains.discard(drain_task)
 
     async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
-        """Close source reservation admission and return its owned claim."""
+        """Close training admission and return its owned claim."""
         if self._closing:
             raise RuntimeError("Fully async rollout function is closed.")
         self._train_admission_open.clear()
+        self._train_batch_lease_admission_open.clear()
+        self._train_admission_epoch += 1
         if self._uses_owned_capacity:
             terminal_frontier: tuple[_TrainAdmissionFrontierTask, ...] = tuple(self._active_executions)
         else:
@@ -544,7 +570,31 @@ class FullyAsyncRolloutFn:
             raise RuntimeError("Train admission hold is not active on this rollout function.")
         self._train_admission_holds.remove(hold)
         if not self._train_admission_holds and not self._closing:
+            self._train_admission_epoch += 1
             self._train_admission_open.set()
+            self._train_batch_lease_admission_open.set()
+
+    async def _strict_weight_version_for_admission_epoch(
+        self,
+        admission_epoch: int,
+    ) -> tuple[int | None, bool]:
+        async with self._strict_weight_version_lock:
+            if self._closing:
+                raise RuntimeError("Fully async rollout closed before the train batch lease was issued.")
+            if not self._train_batch_lease_admission_open.is_set() or admission_epoch != self._train_admission_epoch:
+                return None, False
+            if self._strict_weight_version_epoch != admission_epoch:
+                current = await self._weight_version.refresh(self.args)
+                if self._closing:
+                    raise RuntimeError("Fully async rollout closed before the train batch lease was issued.")
+                if (
+                    not self._train_batch_lease_admission_open.is_set()
+                    or admission_epoch != self._train_admission_epoch
+                ):
+                    return None, False
+                self._strict_weight_version_epoch = admission_epoch
+                self._strict_weight_version = current
+            return self._strict_weight_version, True
 
     async def close(self) -> None:
         """Stop rollout production and settle every retained reservation.
@@ -579,6 +629,7 @@ class FullyAsyncRolloutFn:
         self._closing = True
         self._train_admission_holds.clear()
         self._train_admission_open.clear()
+        self._train_batch_lease_admission_open.set()
         cleanup_error: BaseException | None = None
         shutdown_error: BaseException | None = None
 
@@ -1343,58 +1394,45 @@ class FullyAsyncRolloutFn:
         accepted_legacy_groups: list[LegacyBufferedGroup] = []
         claimed_legacy_group: LegacyBufferedGroup | None = None
         terminal_receipts: list[ReservationTerminalReceipt] = []
+        strict_validation_epochs: list[int | None] = []
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
         staleness_values: list[int] = []
         metric_gatherer = MetricGatherer()
         do_print = True
+        buffer_stats_weight_version: int | None = None
 
         try:
-            while len(data) < target_data_size:
-                buffered_group = await self._next_group()
-                source, group = buffered_group
-                if isinstance(source, _OwnedCompletedGroup):
-                    prompt_group = None
-                    terminal_receipt = source.terminal_receipt
-                    terminal_receipts.append(terminal_receipt)
-                else:
-                    prompt_group = source
-                    terminal_receipt = None
-                    claimed_legacy_group = buffered_group
-
-                if len(group) != args.n_samples_per_prompt:
-                    if terminal_receipt is None:
-                        raise AssertionError(
-                            f"Generated group contains {len(group)} parent slots; "
-                            f"expected {args.n_samples_per_prompt}."
-                        )
-                    raise ValueError(
-                        f"Source reservation {terminal_receipt.executor_receipt.reservation_id} returned "
-                        f"{len(group)} parent slots; expected {args.n_samples_per_prompt}."
-                    )
-                if isinstance(source, _OwnedCompletedGroup):
-                    identity_error = _owned_group_identity_error(source)
-                    if identity_error is not None:
-                        raise identity_error
-
-                # A weight update paused generation mid-group: return it for re-sampling.
-                if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
-                    if terminal_receipt is None:
-                        assert prompt_group is not None
-                        self._recycle(prompt_group)
-                        claimed_legacy_group = None
+            while True:
+                while len(data) < target_data_size:
+                    buffered_group = await self._next_group()
+                    source, group = buffered_group
+                    if isinstance(source, _OwnedCompletedGroup):
+                        prompt_group = None
+                        terminal_receipt = source.terminal_receipt
+                        terminal_receipts.append(terminal_receipt)
                     else:
-                        self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
-                        assert terminal_receipts.pop() is terminal_receipt
-                    aborted_groups_recycled += 1
-                    continue
+                        prompt_group = source
+                        terminal_receipt = None
+                        claimed_legacy_group = buffered_group
 
-                oldest = group_oldest_weight_version(group)
-                current = await self._weight_version.get(args)
-                if oldest is not None and current is not None:
-                    staleness = current - oldest
-                    staleness_values.append(staleness)
-                    if args.max_weight_staleness is not None and staleness > args.max_weight_staleness:
+                    if len(group) != args.n_samples_per_prompt:
+                        if terminal_receipt is None:
+                            raise AssertionError(
+                                f"Generated group contains {len(group)} parent slots; "
+                                f"expected {args.n_samples_per_prompt}."
+                            )
+                        raise ValueError(
+                            f"Source reservation {terminal_receipt.executor_receipt.reservation_id} returned "
+                            f"{len(group)} parent slots; expected {args.n_samples_per_prompt}."
+                        )
+                    if isinstance(source, _OwnedCompletedGroup):
+                        identity_error = _owned_group_identity_error(source)
+                        if identity_error is not None:
+                            raise identity_error
+
+                    # A weight update paused generation mid-group: return it for re-sampling.
+                    if any(s.status == Sample.Status.ABORTED for s in _iter_samples(group)):
                         if terminal_receipt is None:
                             assert prompt_group is not None
                             self._recycle(prompt_group)
@@ -1402,40 +1440,115 @@ class FullyAsyncRolloutFn:
                         else:
                             self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
                             assert terminal_receipts.pop() is terminal_receipt
-                        stale_groups_recycled += 1
-                        logger.info(
-                            f"Recycled stale group (oldest_version={oldest}, current={current}, "
-                            f"staleness={staleness} > max={args.max_weight_staleness})"
-                        )
+                        aborted_groups_recycled += 1
                         continue
 
-                filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
-                if not filter_output.keep:
-                    if terminal_receipt is not None:
-                        self._commit_owned_terminal(
-                            terminal_receipt,
-                            rollout_id=rollout_id,
-                            completed_slot_held=True,
+                    validation_epoch = self._train_admission_epoch
+                    strict_validation_epoch = (
+                        validation_epoch if self._strict_weight_version_epoch == validation_epoch else None
+                    )
+                    oldest = group_oldest_weight_version(group)
+                    current = (
+                        self._strict_weight_version
+                        if strict_validation_epoch is not None
+                        else await self._weight_version.get(args)
+                    )
+                    if oldest is not None and current is not None:
+                        staleness = current - oldest
+                        staleness_values.append(staleness)
+                        if args.max_weight_staleness is not None and staleness > args.max_weight_staleness:
+                            if terminal_receipt is None:
+                                assert prompt_group is not None
+                                self._recycle(prompt_group)
+                                claimed_legacy_group = None
+                            else:
+                                self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
+                                assert terminal_receipts.pop() is terminal_receipt
+                            stale_groups_recycled += 1
+                            logger.info(
+                                f"Recycled stale group (oldest_version={oldest}, current={current}, "
+                                f"staleness={staleness} > max={args.max_weight_staleness})"
+                            )
+                            continue
+
+                    filter_output = call_dynamic_filter(self._dynamic_filter, args, group)
+                    if not filter_output.keep:
+                        if terminal_receipt is not None:
+                            self._commit_owned_terminal(
+                                terminal_receipt,
+                                rollout_id=rollout_id,
+                                completed_slot_held=True,
+                            )
+                            assert terminal_receipts.pop() is terminal_receipt
+                        else:
+                            claimed_legacy_group = None
+                        # Filtered groups are consumed, not replayed: they have no usable gradient signal.
+                        metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                        continue
+
+                    if do_print:
+                        sample = group[0][0] if isinstance(group[0], list) else group[0]
+                        logger.info(
+                            f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                            f"label: {sample.label}, reward: {sample.reward}"
                         )
-                        assert terminal_receipts.pop() is terminal_receipt
-                    else:
-                        claimed_legacy_group = None
-                    # Filtered groups are consumed, not replayed: they have no usable gradient signal.
-                    metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
+                        do_print = False
+
+                    data.append(group)
+                    if terminal_receipt is None:
+                        assert not isinstance(source, _OwnedCompletedGroup)
+                        accepted_legacy_groups.append(buffered_group)
+                    if args.max_weight_staleness is not None:
+                        strict_validation_epochs.append(strict_validation_epoch)
+                    claimed_legacy_group = None
+
+                buffer_stats_weight_version = await self._weight_version.get(args)
+                if self._retained_slots is None:
+                    break
+                await self._train_batch_lease_admission_open.wait()
+                if self._closing:
+                    raise RuntimeError("Fully async rollout closed before the train batch lease was issued.")
+                admission_epoch = self._train_admission_epoch
+                if args.max_weight_staleness is None:
+                    break
+                if admission_epoch == 0:
+                    break
+
+                current, admission_current = await self._strict_weight_version_for_admission_epoch(admission_epoch)
+                if not admission_current:
                     continue
 
-                if do_print:
-                    sample = _first_sample(group)
+                revalidation_indexes = [
+                    index for index, epoch in enumerate(strict_validation_epochs) if epoch != admission_epoch
+                ]
+                stale_groups: list[tuple[int, int, int]] = []
+                if current is not None:
+                    for index in revalidation_indexes:
+                        group = data[index]
+                        oldest = group_oldest_weight_version(group)
+                        if oldest is None:
+                            continue
+                        staleness = current - oldest
+                        staleness_values.append(staleness)
+                        if staleness > args.max_weight_staleness:
+                            stale_groups.append((index, oldest, staleness))
+                for index in revalidation_indexes:
+                    strict_validation_epochs[index] = admission_epoch
+                for index, oldest, staleness in reversed(stale_groups):
+                    terminal_receipt = terminal_receipts[index]
+                    self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
+                    assert terminal_receipts.pop(index) is terminal_receipt
+                    del data[index]
+                    del strict_validation_epochs[index]
+                    stale_groups_recycled += 1
                     logger.info(
-                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
-                        f"label: {sample.label}, reward: {sample.reward}"
+                        f"Recycled stale group (oldest_version={oldest}, current={current}, "
+                        f"staleness={staleness} > max={args.max_weight_staleness})"
                     )
-                    do_print = False
-
-                data.append(group)
-                if terminal_receipt is None:
-                    accepted_legacy_groups.append(buffered_group)
-                claimed_legacy_group = None
+                if stale_groups:
+                    continue
+                buffer_stats_weight_version = current
+                break
 
             sample = _first_sample(data[-1])
             logger.info(
@@ -1468,7 +1581,7 @@ class FullyAsyncRolloutFn:
             if staleness_values:
                 metrics["rollout/fully_async/avg_staleness"] = sum(staleness_values) / len(staleness_values)
                 metrics["rollout/fully_async/max_staleness"] = max(staleness_values)
-            if (stats := output.staleness_stats(await self._weight_version.get(args))) is not None:
+            if (stats := output.staleness_stats(buffer_stats_weight_version)) is not None:
                 (
                     metrics["rollout/fully_async/buffer_avg_staleness"],
                     metrics["rollout/fully_async/buffer_max_staleness"],

@@ -55,10 +55,11 @@ class TrainBatchRollbackReason(Enum):
 
 
 class TrainAdmissionHold(ABC):
-    """Own one claim that keeps new rollout source admission closed.
+    """Own one claim that keeps training admission closed.
 
-    Active holds block new source reservations. Admission remains closed until
-    every active hold is released or the rollout lifecycle begins closing.
+    Active holds block both new source reservations and owned train-batch
+    lease issuance. Admission remains closed until every active hold is
+    released or the rollout lifecycle begins closing.
     """
 
     def __init__(self) -> None:
@@ -84,10 +85,11 @@ class TrainAdmissionHold(ABC):
         """Implement terminal observation for this hold's admission frontier."""
 
     def release(self) -> None:
-        """Release this hold's claim on source admission.
+        """Release this hold's claim on training admission.
 
         A release attempt claims the handle even if its implementation raises.
-        Source reservation reopens only after every active hold is released.
+        Source reservation and owned lease issuance reopen only after every
+        active hold is released.
 
         Raises:
             RuntimeError: If release was already attempted.
