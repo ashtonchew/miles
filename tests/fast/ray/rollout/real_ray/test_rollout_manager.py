@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import textwrap
+import threading
 import time
 
 import pytest
@@ -24,11 +25,15 @@ from miles.rollout.base_types import (
     LeasedRolloutFnTrainOutput,
     RolloutFnEvalInput,
     RolloutFnEvalOutput,
+    RolloutFnLifecycle,
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
+    TrainAdmissionHold,
     TrainBatchLease,
     TrainBatchRollbackReason,
 )
+from miles.rollout.checkpoint_eval import CheckpointEvalFn
+from miles.utils.async_utils import get_async_loop
 
 
 class RecordingTrainBatchLease(TrainBatchLease):
@@ -41,6 +46,136 @@ class RecordingTrainBatchLease(TrainBatchLease):
 
     def _rollback(self, reason: TrainBatchRollbackReason) -> None:
         self._events.append(f"rollback:{reason.name}")
+
+
+class RecordingTrainAdmissionHold(TrainAdmissionHold):
+    def __init__(self, hold_index: int, lifecycle: RecordingRolloutLifecycle) -> None:
+        super().__init__()
+        self._hold_index = hold_index
+        self._lifecycle = lifecycle
+
+    async def _wait_terminal(self) -> None:
+        self._lifecycle.wait_started.set()
+        while not self._lifecycle.allow_wait.is_set():
+            await asyncio.sleep(0)
+        self._lifecycle.loops.append(asyncio.get_running_loop())
+        self._lifecycle.events.append(f"wait:{self._hold_index}")
+
+    def _release(self) -> None:
+        self._lifecycle.release_started.set()
+        if not self._lifecycle.allow_release.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to release the train admission hold.")
+        self._lifecycle.loops.append(asyncio.get_running_loop())
+        self._lifecycle.active_holds.remove(self._hold_index)
+        self._lifecycle.events.append(f"release:{self._hold_index}")
+
+
+class RecordingRolloutLifecycle(RolloutFnLifecycle):
+    def __init__(self, events: list[str], label: str | None = None) -> None:
+        self.events = events
+        self.label = label
+        self.loops: list[asyncio.AbstractEventLoop] = []
+        self.holds: list[RecordingTrainAdmissionHold] = []
+        self.active_holds: set[int] = set()
+        self.wait_started = threading.Event()
+        self.allow_wait = threading.Event()
+        self.allow_wait.set()
+        self.release_started = threading.Event()
+        self.allow_release = threading.Event()
+        self.allow_release.set()
+
+    async def prepare_checkpoint(self, rollout_id: int) -> None:
+        raise AssertionError(f"checkpoint preparation for rollout {rollout_id} is outside this test")
+
+    async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+        self.loops.append(asyncio.get_running_loop())
+        hold_index = len(self.holds)
+        hold = RecordingTrainAdmissionHold(hold_index, self)
+        self.holds.append(hold)
+        self.active_holds.add(hold_index)
+        self.events.append(f"acquire:{hold_index}")
+        return hold
+
+    async def close(self) -> None:
+        self.loops.append(asyncio.get_running_loop())
+        self.events.append("close" if self.label is None else f"close:{self.label}")
+
+
+class BlockingAcquireRolloutLifecycle(RecordingRolloutLifecycle):
+    def __init__(
+        self,
+        events: list[str],
+        acquire_started: threading.Event,
+        allow_acquire: threading.Event,
+    ) -> None:
+        super().__init__(events)
+        self._acquire_started = acquire_started
+        self._allow_acquire = allow_acquire
+
+    async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+        self.events.append("acquire_started")
+        self._acquire_started.set()
+        while not self._allow_acquire.is_set():
+            await asyncio.sleep(0)
+        self.events.append("acquire_finished")
+        return await super().acquire_train_admission_hold()
+
+
+class CloseDominatedAcquireRolloutLifecycle(BlockingAcquireRolloutLifecycle):
+    def __init__(
+        self,
+        events: list[str],
+        acquire_started: threading.Event,
+        allow_acquire: threading.Event,
+    ) -> None:
+        super().__init__(events, acquire_started, allow_acquire)
+        self._closed = False
+
+    async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+        hold = await super().acquire_train_admission_hold()
+        if self._closed:
+            self.active_holds.clear()
+        return hold
+
+    async def close(self) -> None:
+        self._closed = True
+        self.active_holds.clear()
+        self.events.append("close")
+
+
+class FailingOnceCloseRolloutLifecycle(RecordingRolloutLifecycle):
+    def __init__(self, events: list[str], failure: BaseException) -> None:
+        super().__init__(events)
+        self._failure: BaseException | None = failure
+
+    async def close(self) -> None:
+        self.loops.append(asyncio.get_running_loop())
+        if self._failure is not None:
+            failure = self._failure
+            self._failure = None
+            self.events.append("close_failed")
+            raise failure
+        self.events.append("close_succeeded")
+
+
+class BlockingCloseRolloutLifecycle(RecordingRolloutLifecycle):
+    def __init__(
+        self,
+        events: list[str],
+        close_started: threading.Event,
+        allow_close: threading.Event,
+    ) -> None:
+        super().__init__(events)
+        self._close_started = close_started
+        self._allow_close = allow_close
+
+    async def close(self) -> None:
+        self.loops.append(asyncio.get_running_loop())
+        self.events.append("close_started")
+        self._close_started.set()
+        while not self._allow_close.is_set():
+            await asyncio.sleep(0)
+        self.events.append("close_finished")
 
 
 @pytest.fixture
@@ -96,6 +231,24 @@ def patch_low_level(monkeypatch):
 
 def _make_manager(args, pg):
     return RolloutManager.__ray_actor_class__(args, pg)
+
+
+def _install_train_rollout_lifecycle(manager, lifecycle: RolloutFnLifecycle) -> None:
+    manager._train_rollout_lifecycle = lifecycle
+    manager._lifecycle_async_loop = get_async_loop()
+
+
+def _install_rollout_lifecycles(manager, *lifecycles: RolloutFnLifecycle) -> None:
+    manager._rollout_lifecycles = lifecycles
+    manager._closed_rollout_lifecycles = []
+    manager._lifecycle_async_loop = get_async_loop()
+
+
+@pytest.fixture
+def lifecycle_manager(placement_group_factory, tmp_path, patch_low_level):
+    args = _make_test_args(tmp_path, models=[("actor", True)])
+    args.debug_train_only = True
+    return _make_manager(args, placement_group_factory(2))
 
 
 def _write_sglang_config(tmp_path, *, models: list[tuple[str, bool]]) -> str:
@@ -177,6 +330,495 @@ class TestRolloutManagerInit:
         for h in eal.rollout_engines:
             assert isinstance(h, ray.actor.ActorHandle)
             assert ray.get(h.health_generate.remote(timeout=1.0)) is True
+
+
+@pytest.mark.asyncio
+class TestRolloutLifecycle:
+    async def test_concurrent_lifecycle_calls_retain_one_event_loop(
+        self,
+        ray_local_mode,
+        placement_group_factory,
+        tmp_path,
+        patch_low_level,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+        import miles.utils.async_utils as async_utils
+
+        args = _make_test_args(tmp_path, models=[("actor", True)])
+        args.debug_train_only = True
+        args.eval_function_path = args.rollout_function_path
+        pg = placement_group_factory(2)
+        lifecycle = RecordingRolloutLifecycle([])
+        monkeypatch.setattr(rmgr, "load_rollout_function", lambda input, path: lifecycle)
+        original_async_loop_thread = async_utils.AsyncLoopThread
+        created_loops: list[async_utils.AsyncLoopThread] = []
+
+        def create_async_loop() -> async_utils.AsyncLoopThread:
+            async_loop = original_async_loop_thread()
+            created_loops.append(async_loop)
+            return async_loop
+
+        monkeypatch.setattr(rmgr, "get_async_loop", create_async_loop)
+        monkeypatch.setattr(async_utils, "get_async_loop", create_async_loop)
+        manager = _make_manager(args, pg)
+
+        try:
+            hold_ids = await asyncio.gather(
+                manager.acquire_train_admission_hold(),
+                manager.acquire_train_admission_hold(),
+            )
+            for hold_id in hold_ids:
+                await manager.release_train_admission_hold(hold_id)
+
+            assert len(created_loops) == 1
+            assert len({id(loop) for loop in lifecycle.loops}) == 1
+        finally:
+            for async_loop in created_loops:
+                async_loop.loop.call_soon_threadsafe(async_loop.loop.stop)
+                async_loop._thread.join(timeout=1)
+
+    async def test_init_deduplicates_shared_lifecycle_by_identity(
+        self,
+        ray_local_mode,
+        placement_group_factory,
+        tmp_path,
+        patch_low_level,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        args = _make_test_args(tmp_path, models=[("actor", True)])
+        args.debug_train_only = True
+        args.eval_function_path = args.rollout_function_path
+        pg = placement_group_factory(2)
+        lifecycle = RecordingRolloutLifecycle([])
+        monkeypatch.setattr(rmgr, "load_rollout_function", lambda input, path: lifecycle)
+
+        manager = _make_manager(args, pg)
+
+        assert manager._train_rollout_lifecycle is lifecycle
+        assert manager._rollout_lifecycles == (lifecycle,)
+
+    async def test_lifecycle_calls_do_not_consume_manager_default_executor(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        _install_rollout_lifecycles(manager, lifecycle)
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+
+        async def reject_to_thread(*args, **kwargs):
+            raise AssertionError("lifecycle calls must not consume the manager default executor")
+
+        monkeypatch.setattr(asyncio, "to_thread", reject_to_thread)
+
+        hold_id = await manager.acquire_train_admission_hold()
+        await manager.wait_train_admission_hold(hold_id)
+        await manager.release_train_admission_hold(hold_id)
+        await manager.dispose()
+
+        assert events == ["acquire:0", "wait:0", "release:0", "close", "analysis"]
+
+    async def test_dispose_rejects_hold_acquired_concurrently_with_lifecycle_close(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        acquire_started = threading.Event()
+        allow_acquire = threading.Event()
+        lifecycle = CloseDominatedAcquireRolloutLifecycle(events, acquire_started, allow_acquire)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        _install_rollout_lifecycles(manager, lifecycle)
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+        acquire_task = asyncio.create_task(manager.acquire_train_admission_hold())
+        assert await asyncio.to_thread(acquire_started.wait, 5)
+
+        await manager.dispose()
+        allow_acquire.set()
+
+        with pytest.raises(RuntimeError) as acquisition_error:
+            await acquire_task
+
+        assert str(acquisition_error.value) == "Rollout manager lifecycle is closing."
+        assert manager._train_admission_holds == {}
+        assert lifecycle.active_holds == set()
+        assert events == ["acquire_started", "close", "analysis", "acquire_finished", "acquire:0"]
+
+    async def test_ordinary_close_bearing_rollout_remains_legacy_compatible(
+        self,
+        ray_local_mode,
+        placement_group_factory,
+        tmp_path,
+        patch_low_level,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        args = _make_test_args(tmp_path, models=[("actor", True)])
+        args.debug_train_only = True
+        args.eval_function_path = args.rollout_function_path
+        pg = placement_group_factory(2)
+        events: list[str] = []
+
+        class OrdinaryRollout:
+            def __call__(self, input):
+                raise AssertionError("ordinary rollout invocation is outside this test")
+
+            def close(self) -> None:
+                events.append("ordinary_close")
+
+        ordinary_rollout = OrdinaryRollout()
+        monkeypatch.setattr(rmgr, "load_rollout_function", lambda input, path: ordinary_rollout)
+        manager = _make_manager(args, pg)
+
+        assert manager._train_rollout_lifecycle is None
+        assert manager._rollout_lifecycles == ()
+        assert await manager.acquire_train_admission_hold() is None
+        await manager.wait_train_admission_hold(None)
+        await manager.release_train_admission_hold(None)
+        await manager.dispose()
+
+        assert events == []
+
+    async def test_manager_owns_exact_admission_holds_behind_opaque_ids(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        manager_loop = asyncio.get_running_loop()
+
+        first_hold_id = await manager.acquire_train_admission_hold()
+        second_hold_id = await manager.acquire_train_admission_hold()
+        await manager.wait_train_admission_hold(first_hold_id)
+        await manager.release_train_admission_hold(first_hold_id)
+        with pytest.raises(RuntimeError) as duplicate_release:
+            await manager.release_train_admission_hold(first_hold_id)
+        await manager.wait_train_admission_hold(second_hold_id)
+        await manager.release_train_admission_hold(second_hold_id)
+
+        assert (first_hold_id, second_hold_id) == (0, 1)
+        assert str(duplicate_release.value) == "Unknown train admission hold 0."
+        assert events == [
+            "acquire:0",
+            "acquire:1",
+            "wait:0",
+            "release:0",
+            "wait:1",
+            "release:1",
+        ]
+        assert len({id(loop) for loop in lifecycle.loops}) == 1
+        assert lifecycle.loops[0] is not manager_loop
+
+    async def test_cancelled_hold_acquisition_releases_the_unpublished_handle(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        acquire_started = threading.Event()
+        allow_acquire = threading.Event()
+        lifecycle = BlockingAcquireRolloutLifecycle(events, acquire_started, allow_acquire)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        acquire_task = asyncio.create_task(manager.acquire_train_admission_hold())
+        assert await asyncio.to_thread(acquire_started.wait, 5)
+
+        acquire_task.cancel()
+        await asyncio.sleep(0)
+
+        try:
+            assert acquire_task.done() is False
+            allow_acquire.set()
+            with pytest.raises(asyncio.CancelledError):
+                await acquire_task
+            assert lifecycle.active_holds == set()
+            assert manager._train_admission_holds == {}
+            assert events == ["acquire_started", "acquire_finished", "acquire:0", "release:0"]
+        finally:
+            allow_acquire.set()
+
+            async def wait_for_hold() -> None:
+                while not lifecycle.holds:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_hold(), timeout=1)
+            if lifecycle.active_holds:
+                lifecycle.holds[0].release()
+
+    async def test_cancelled_hold_wait_settles_and_leaves_handle_releasable(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        lifecycle.allow_wait.clear()
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        hold_id = await manager.acquire_train_admission_hold()
+        wait_task = asyncio.create_task(manager.wait_train_admission_hold(hold_id))
+        assert await asyncio.to_thread(lifecycle.wait_started.wait, 5)
+
+        wait_task.cancel()
+        await asyncio.sleep(0)
+        assert wait_task.done() is False
+        lifecycle.allow_wait.set()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+        await manager.release_train_admission_hold(hold_id)
+
+        assert events == ["acquire:0", "wait:0", "release:0"]
+        assert lifecycle.active_holds == set()
+
+    async def test_cancelled_hold_release_settles_and_consumes_handle(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        lifecycle.allow_release.clear()
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        hold_id = await manager.acquire_train_admission_hold()
+        release_task = asyncio.create_task(manager.release_train_admission_hold(hold_id))
+        assert await asyncio.to_thread(lifecycle.release_started.wait, 5)
+
+        release_task.cancel()
+        await asyncio.sleep(0)
+        assert release_task.done() is False
+        with pytest.raises(RuntimeError) as duplicate_release:
+            await manager.release_train_admission_hold(hold_id)
+        lifecycle.allow_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await release_task
+
+        assert str(duplicate_release.value) == f"Unknown train admission hold {hold_id}."
+        assert events == ["acquire:0", "release:0"]
+        assert lifecycle.active_holds == set()
+
+    async def test_dispose_closes_unique_rollout_lifecycles_before_manager_resources(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        train_lifecycle = RecordingRolloutLifecycle(events, label="train")
+        eval_lifecycle = RecordingRolloutLifecycle(events, label="eval")
+        _install_rollout_lifecycles(manager, train_lifecycle, eval_lifecycle)
+
+        class RecordingDataSource:
+            def close(self) -> None:
+                events.append("source_close")
+
+        manager.data_source = RecordingDataSource()
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+
+        await manager.dispose()
+
+        assert events == ["close:train", "close:eval", "source_close", "analysis"]
+
+    async def test_dispose_continues_manager_cleanup_after_first_failure(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        failure = RuntimeError("source cleanup failed")
+
+        class FailingOnceDataSource:
+            def __init__(self) -> None:
+                self._failure: BaseException | None = failure
+
+            def close(self) -> None:
+                events.append("source_close")
+                if self._failure is not None:
+                    source_failure = self._failure
+                    self._failure = None
+                    raise source_failure
+
+        class RecordingDisposable:
+            def __init__(self, event: str) -> None:
+                self._event = event
+
+            def dispose(self) -> None:
+                events.append(self._event)
+
+        class RecordingCheckpointEvalFn(CheckpointEvalFn):
+            async def evaluate_checkpoint(
+                self,
+                checkpoint_dir: str,
+                input: RolloutFnEvalInput,
+            ) -> RolloutFnEvalOutput:
+                raise AssertionError("cleanup must not invoke evaluation")
+
+            def dispose(self) -> None:
+                events.append("checkpoint_dispose")
+
+        class RecordingMonitor:
+            def stop(self) -> None:
+                events.append("monitor_stop")
+
+        manager.data_source = FailingOnceDataSource()
+        manager._metric_checker = RecordingDisposable("metric_dispose")
+        manager.eval_generate_rollout = RecordingCheckpointEvalFn()
+        manager._health_monitors = [RecordingMonitor()]
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+
+        with pytest.raises(RuntimeError) as cleanup_error:
+            await manager.dispose()
+
+        assert cleanup_error.value is failure
+        assert events == [
+            "source_close",
+            "analysis",
+            "metric_dispose",
+            "checkpoint_dispose",
+            "monitor_stop",
+        ]
+
+        await manager.dispose()
+        await manager.dispose()
+
+        assert events == [
+            "source_close",
+            "analysis",
+            "metric_dispose",
+            "checkpoint_dispose",
+            "monitor_stop",
+            "source_close",
+        ]
+
+    async def test_dispose_retries_failed_lifecycle_before_releasing_manager_resources(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        failure = RuntimeError("lifecycle close failed")
+        lifecycle = FailingOnceCloseRolloutLifecycle(events, failure)
+        _install_rollout_lifecycles(manager, lifecycle)
+
+        class RecordingDataSource:
+            def close(self) -> None:
+                events.append("source_close")
+
+        manager.data_source = RecordingDataSource()
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+
+        with pytest.raises(RuntimeError) as close_error:
+            await manager.dispose()
+
+        assert close_error.value is failure
+        assert events == ["close_failed"]
+
+        await manager.dispose()
+
+        assert events == ["close_failed", "close_succeeded", "source_close", "analysis"]
+
+    async def test_cancelled_dispose_waits_for_lifecycle_then_cleans_manager_resources(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        close_started = threading.Event()
+        allow_close = threading.Event()
+        lifecycle = BlockingCloseRolloutLifecycle(events, close_started, allow_close)
+        _install_rollout_lifecycles(manager, lifecycle)
+
+        class RecordingDataSource:
+            def close(self) -> None:
+                events.append("source_close")
+
+        manager.data_source = RecordingDataSource()
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+        dispose_task = asyncio.create_task(manager.dispose())
+        assert await asyncio.to_thread(close_started.wait, 5)
+
+        dispose_task.cancel()
+        await asyncio.sleep(0)
+
+        assert dispose_task.done() is False
+        assert events == ["close_started"]
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await dispose_task
+
+        assert events == ["close_started", "close_finished", "source_close", "analysis"]
+
+    async def test_overlapping_dispose_calls_close_and_clean_up_once(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        events: list[str] = []
+        close_started = threading.Event()
+        allow_close = threading.Event()
+        lifecycle = BlockingCloseRolloutLifecycle(events, close_started, allow_close)
+        _install_rollout_lifecycles(manager, lifecycle)
+
+        class RecordingDataSource:
+            def close(self) -> None:
+                events.append("source_close")
+
+        manager.data_source = RecordingDataSource()
+        monkeypatch.setattr(
+            rmgr.event_analyzer,
+            "run_analysis_from_args",
+            lambda args: events.append("analysis"),
+        )
+        first_dispose = asyncio.create_task(manager.dispose())
+        assert await asyncio.to_thread(close_started.wait, 5)
+        second_dispose = asyncio.create_task(manager.dispose())
+        await asyncio.sleep(0)
+
+        assert second_dispose.done() is False
+        assert events == ["close_started"]
+
+        allow_close.set()
+        await asyncio.gather(first_dispose, second_dispose)
+
+        assert events == ["close_started", "close_finished", "source_close", "analysis"]
 
 
 @pytest.mark.asyncio
