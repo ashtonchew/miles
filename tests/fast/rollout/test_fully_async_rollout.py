@@ -6,7 +6,7 @@ import asyncio
 import gc
 from argparse import Namespace
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import replace
 
@@ -19,6 +19,7 @@ from miles.rollout.base_types import (
     LeasedRolloutFnTrainOutput,
     RolloutFnConstructorInput,
     RolloutFnEvalInput,
+    RolloutFnLifecycle,
     RolloutFnTrainInput,
     TrainBatchRollbackReason,
 )
@@ -35,6 +36,18 @@ from miles.utils.async_utils import AsyncLoopThread
 from miles.utils.types import Sample
 
 N_SAMPLES_PER_PROMPT = 2
+
+
+@pytest.fixture
+def lifecycle_loop() -> Iterator[AsyncLoopThread]:
+    loop_thread = AsyncLoopThread()
+    try:
+        yield loop_thread
+    finally:
+        loop_thread.loop.call_soon_threadsafe(loop_thread.loop.stop)
+        loop_thread._thread.join(timeout=1)
+        assert not loop_thread._thread.is_alive()
+        loop_thread.loop.close()
 
 
 class FakeGenerateState:
@@ -1739,6 +1752,7 @@ async def test_train_admission_hold_blocks_new_source_reservations_until_release
     data_source = FakeReservationDataSource([reservation])
     fn = make_owned_fn(monkeypatch, data_source)
 
+    assert isinstance(fn, RolloutFnLifecycle)
     hold = await fn.acquire_train_admission_hold()
     train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=54)))
     for _ in range(10):
@@ -2101,6 +2115,39 @@ async def test_train_admission_hold_fences_retained_capacity_waiter(monkeypatch)
 
     hold.release()
     await wait_until(lambda: data_source.reserved == reservations)
+    await fn.close()
+
+
+async def test_train_admission_hold_blocks_completed_batch_lease_until_checkpoint_prepares(monkeypatch):
+    reservation = make_reservation(74)
+    data_source = FakeReservationDataSource([reservation])
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        generation_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_owned_fn(monkeypatch, data_source, generate)
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=74)))
+    await generation_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+
+    release_generation.set()
+    await hold.wait_terminal()
+    assert fn._output is not None
+    await wait_until(lambda: fn._output.qsize() == 0)
+
+    assert train.done() is False
+    assert await fn.prepare_checkpoint(rollout_id=74) is None
+
+    hold.release()
+    output = await asyncio.wait_for(train, timeout=1)
+
+    assert output.samples == [list(reservation.samples)]
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    assert data_source.requeued == [[reservation]]
     await fn.close()
 
 
@@ -2539,6 +2586,57 @@ async def test_close_wakes_lease_blocked_drain_and_rolls_back_once(monkeypatch):
     assert data_source.requeued == [[reservation]]
 
 
+async def test_checkpoint_preparation_rejects_an_open_train_batch_lease(monkeypatch):
+    reservation = make_reservation(65)
+    data_source = FakeReservationDataSource([reservation])
+    fn = make_owned_fn(monkeypatch, data_source)
+    output = await fn(RolloutFnTrainInput(rollout_id=65))
+    hold = await fn.acquire_train_admission_hold()
+
+    with pytest.raises(RuntimeError) as checkpoint_error:
+        await fn.prepare_checkpoint(rollout_id=65)
+
+    assert str(checkpoint_error.value) == "Cannot prepare checkpoint 65 with open train batch leases: [65]."
+
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+
+    assert await fn.prepare_checkpoint(rollout_id=65) is None
+    hold.release()
+    await fn.close()
+
+
+async def test_blocked_close_permanently_invalidates_admission_hold_then_retries(monkeypatch):
+    reservations = [make_reservation(66), make_reservation(67)]
+    data_source = FakeReservationDataSource(reservations)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        retained_groups=1,
+        completed_groups=2,
+    )
+    output = await fn(RolloutFnTrainInput(rollout_id=66))
+    hold = await fn.acquire_train_admission_hold()
+
+    with pytest.raises(RuntimeError) as close_error:
+        await fn.close()
+
+    assert str(close_error.value) == "Cannot close fully async rollout with open train batch leases: [66]."
+    with pytest.raises(RuntimeError) as release_error:
+        hold.release()
+    assert str(release_error.value) == "Train admission hold is not active on this rollout function."
+
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert data_source.reserved == reservations[:1]
+
+    await fn.close()
+
+    assert data_source.requeued[0] == [reservations[0]]
+    assert data_source.requeued[0][0] is reservations[0]
+
+
 async def test_cancelled_terminal_wait_preserves_the_hold_and_frontier(monkeypatch):
     reservation = make_reservation(60)
     data_source = FakeReservationDataSource([reservation])
@@ -2923,19 +3021,222 @@ async def test_owned_lease_settlement_backfills_while_another_group_is_active(mo
     assert data_source.reserved == reservations
 
 
+async def test_failed_owned_lease_rollback_transfers_cleanup_to_checkpoint_retry(monkeypatch, lifecycle_loop):
+    reservations = [make_reservation(70), make_reservation(71)]
+    data_source = FakeReservationDataSource(reservations)
+    requeue_error = RuntimeError("lease rollback failed")
+    original_requeue = data_source.requeue_reservations
+    requeue_attempts = 0
+
+    def requeue_reservations(requeued: Sequence[SourceReservation]) -> None:
+        nonlocal requeue_attempts
+        requeue_attempts += 1
+        if requeue_attempts == 1:
+            raise requeue_error
+        original_requeue(requeued)
+
+    data_source.requeue_reservations = requeue_reservations
+    fn = make_owned_fn(monkeypatch, data_source)
+    output = await asyncio.to_thread(
+        lifecycle_loop.run,
+        fn(RolloutFnTrainInput(rollout_id=70)),
+    )
+
+    with pytest.raises(RuntimeError) as rollback_error:
+        output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+
+    assert rollback_error.value is requeue_error
+    with pytest.raises(RuntimeError) as repeated_rollback_error:
+        output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    assert str(repeated_rollback_error.value) == "Train batch lease for rollout 70 already has a settlement attempt."
+    assert fn._retained_slots is not None
+    assert fn._completed_slots is not None
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (True, 0)
+    await asyncio.to_thread(lifecycle_loop.run, fn.acquire_train_admission_hold())
+    assert await asyncio.to_thread(lifecycle_loop.run, fn.prepare_checkpoint(rollout_id=70)) is None
+    await asyncio.to_thread(lifecycle_loop.run, asyncio.sleep(0.01))
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    assert (data_source.reserved, data_source.requeued, requeue_attempts) == (
+        reservations[:1],
+        [[reservations[0]]],
+        2,
+    )
+
+    await asyncio.to_thread(lifecycle_loop.run, fn.close())
+    await asyncio.to_thread(lifecycle_loop.run, fn.close())
+
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    assert (data_source.acknowledged, data_source.requeued, requeue_attempts) == (
+        [],
+        [[reservations[0]]],
+        2,
+    )
+
+
+async def test_failed_owned_lease_commit_requeues_before_checkpoint(monkeypatch):
+    reservation = make_reservation(75)
+    data_source = FakeReservationDataSource([reservation])
+    acknowledge_error = RuntimeError("lease commit failed")
+    acknowledge_attempts = 0
+
+    def acknowledge_reservations(
+        reservations: Sequence[SourceReservation],
+        *,
+        rollout_id: int,
+    ) -> None:
+        nonlocal acknowledge_attempts
+        acknowledge_attempts += 1
+        raise acknowledge_error
+
+    data_source.acknowledge_reservations = acknowledge_reservations
+    fn = make_owned_fn(monkeypatch, data_source)
+    output = await fn(RolloutFnTrainInput(rollout_id=75))
+
+    with pytest.raises(RuntimeError) as commit_error:
+        output.lease.commit()
+
+    assert commit_error.value is acknowledge_error
+    with pytest.raises(RuntimeError) as repeated_commit_error:
+        output.lease.commit()
+    assert str(repeated_commit_error.value) == "Train batch lease for rollout 75 already has a settlement attempt."
+    assert fn._retained_slots is not None
+    assert fn._completed_slots is not None
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    assert data_source.requeued == [[reservation]]
+    await fn.acquire_train_admission_hold()
+
+    assert await fn.prepare_checkpoint(rollout_id=75) is None
+
+    assert acknowledge_attempts == 1
+    assert data_source.acknowledged == []
+    assert data_source.requeued == [[reservation]]
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    await fn.close()
+
+
+async def test_cross_thread_failed_owned_lease_commit_retries_rollback_through_checkpoint_and_close(
+    monkeypatch,
+    lifecycle_loop,
+):
+    reservation = make_reservation(77)
+    data_source = FakeReservationDataSource([reservation])
+    commit_error = RuntimeError("cross-thread lease commit failed")
+    rollback_error = RuntimeError("cross-thread commit rollback failed")
+    checkpoint_error = RuntimeError("checkpoint rollback retry failed")
+    original_requeue = data_source.requeue_reservations
+    acknowledge_attempts = 0
+    requeue_attempts = 0
+
+    def acknowledge_reservations(
+        reservations: Sequence[SourceReservation],
+        *,
+        rollout_id: int,
+    ) -> None:
+        nonlocal acknowledge_attempts
+        acknowledge_attempts += 1
+        raise commit_error
+
+    def requeue_reservations(reservations: Sequence[SourceReservation]) -> None:
+        nonlocal requeue_attempts
+        requeue_attempts += 1
+        if requeue_attempts == 1:
+            raise rollback_error
+        if requeue_attempts == 2:
+            raise checkpoint_error
+        original_requeue(reservations)
+
+    data_source.acknowledge_reservations = acknowledge_reservations
+    data_source.requeue_reservations = requeue_reservations
+    fn = make_owned_fn(monkeypatch, data_source)
+    output = await asyncio.to_thread(
+        lifecycle_loop.run,
+        fn(RolloutFnTrainInput(rollout_id=77)),
+    )
+
+    with pytest.raises(RuntimeError) as first_commit_error:
+        output.lease.commit()
+
+    assert first_commit_error.value is commit_error
+    assert first_commit_error.value.__cause__ is rollback_error
+    await asyncio.to_thread(lifecycle_loop.run, fn.acquire_train_admission_hold())
+
+    with pytest.raises(RuntimeError) as failed_checkpoint:
+        await asyncio.to_thread(lifecycle_loop.run, fn.prepare_checkpoint(rollout_id=77))
+
+    assert failed_checkpoint.value is checkpoint_error
+    assert acknowledge_attempts == 1
+    assert requeue_attempts == 2
+    assert data_source.acknowledged == []
+    assert data_source.requeued == []
+    assert fn._retained_slots is not None
+    assert fn._completed_slots is not None
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (True, 0)
+
+    await asyncio.to_thread(lifecycle_loop.run, fn.close())
+
+    assert acknowledge_attempts == 1
+    assert requeue_attempts == 3
+    assert data_source.acknowledged == []
+    assert data_source.requeued == [[reservation]]
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    assert fn._closed
+
+
+async def test_checkpoint_preparation_fails_while_terminal_rollback_remains_pending(monkeypatch):
+    reservation = make_reservation(76)
+    data_source = FakeReservationDataSource([reservation])
+    lease_requeue_error = RuntimeError("lease rollback failed")
+    checkpoint_requeue_error = RuntimeError("checkpoint rollback retry failed")
+    original_requeue = data_source.requeue_reservations
+    requeue_attempts = 0
+
+    def requeue_reservations(requeued: Sequence[SourceReservation]) -> None:
+        nonlocal requeue_attempts
+        requeue_attempts += 1
+        if requeue_attempts == 1:
+            raise lease_requeue_error
+        if requeue_attempts == 2:
+            raise checkpoint_requeue_error
+        original_requeue(requeued)
+
+    data_source.requeue_reservations = requeue_reservations
+    fn = make_owned_fn(monkeypatch, data_source)
+    output = await fn(RolloutFnTrainInput(rollout_id=76))
+
+    with pytest.raises(RuntimeError) as lease_error:
+        output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+
+    assert lease_error.value is lease_requeue_error
+    await fn.acquire_train_admission_hold()
+
+    with pytest.raises(RuntimeError) as checkpoint_error:
+        await fn.prepare_checkpoint(rollout_id=76)
+
+    assert checkpoint_error.value is checkpoint_requeue_error
+    assert fn._retained_slots is not None
+    assert fn._completed_slots is not None
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (True, 0)
+    assert data_source.requeued == []
+
+    assert await fn.prepare_checkpoint(rollout_id=76) is None
+
+    assert (fn._retained_slots.locked(), fn._completed_slots.qsize()) == (False, 1)
+    assert data_source.requeued == [[reservation]]
+    await fn.close()
+
+
 @pytest.mark.parametrize(
     "rollback_reason",
     [None, TrainBatchRollbackReason.HANDOFF_FAILED],
 )
 async def test_owned_lease_settlement_wakes_capacity_waiter_on_lifecycle_loop(
     monkeypatch,
+    lifecycle_loop,
     rollback_reason: TrainBatchRollbackReason | None,
 ):
     reservations = [make_reservation(20), make_reservation(21)]
     data_source = FakeReservationDataSource(reservations)
     fn = make_owned_fn(monkeypatch, data_source)
-    lifecycle_loop = AsyncLoopThread()
-
     output = await asyncio.to_thread(
         lifecycle_loop.run,
         fn(RolloutFnTrainInput(rollout_id=20)),

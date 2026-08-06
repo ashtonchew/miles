@@ -33,6 +33,7 @@ from miles.rollout.base_types import (
     RolloutFnEvalInput,
     RolloutFnEvalOutput,
     RolloutFnInput,
+    RolloutFnLifecycle,
     RolloutFnOutput,
     RolloutFnTrainOutput,
     TrainAdmissionHold,
@@ -135,6 +136,8 @@ class _OwnedTrainBatchLease(TrainBatchLease):
         completed_slots: asyncio.Queue[object],
         completed_slot_available: asyncio.Event,
         owned_capacity_released: asyncio.Event,
+        on_settled: Callable[[TrainBatchLease], None],
+        on_rollback_failed: Callable[[list[ReservationTerminalReceipt]], None],
     ) -> None:
         super().__init__(rollout_id=rollout_id)
         self._owner_loop = asyncio.get_running_loop()
@@ -144,20 +147,40 @@ class _OwnedTrainBatchLease(TrainBatchLease):
         self._completed_slots = completed_slots
         self._completed_slot_available = completed_slot_available
         self._owned_capacity_released = owned_capacity_released
+        self._on_settled = on_settled
+        self._on_rollback_failed = on_rollback_failed
 
     def _commit(self) -> None:
         self._run_on_owner_loop(self._commit_on_owner_loop)
 
     def _commit_on_owner_loop(self) -> None:
-        self._ownership.commit_batch(self._terminal_receipts, rollout_id=self.rollout_id)
+        try:
+            self._ownership.commit_batch(self._terminal_receipts, rollout_id=self.rollout_id)
+        except BaseException as commit_error:
+            try:
+                self._ownership.rollback_batch(self._terminal_receipts)
+            except BaseException as rollback_error:
+                self._on_rollback_failed(self._terminal_receipts)
+                self._on_settled(self)
+                raise commit_error from rollback_error
+            self._release_capacity()
+            self._on_settled(self)
+            raise
         self._release_capacity()
+        self._on_settled(self)
 
     def _rollback(self, reason: TrainBatchRollbackReason) -> None:
         self._run_on_owner_loop(lambda: self._rollback_on_owner_loop(reason))
 
     def _rollback_on_owner_loop(self, reason: TrainBatchRollbackReason) -> None:
-        self._ownership.rollback_batch(self._terminal_receipts)
+        try:
+            self._ownership.rollback_batch(self._terminal_receipts)
+        except BaseException:
+            self._on_rollback_failed(self._terminal_receipts)
+            self._on_settled(self)
+            raise
         self._release_capacity()
+        self._on_settled(self)
 
     def _run_on_owner_loop(self, operation: Callable[[], None]) -> None:
         try:
@@ -417,7 +440,7 @@ class _CachedWeightVersion:
         return self._value
 
 
-class FullyAsyncRolloutFn:
+class FullyAsyncRolloutFn(RolloutFnLifecycle):
     """Continuous rollout generation decoupled from training steps.
 
     The worker runs as a long-lived task on the shared rollout event loop, created
@@ -459,6 +482,7 @@ class FullyAsyncRolloutFn:
         self._strict_weight_version: int | None = None
         self._strict_weight_version_lock = asyncio.Lock()
         self._train_admission_holds: set[_OwnedTrainAdmissionHold] = set()
+        self._open_train_batch_leases: set[TrainBatchLease] = set()
         execution_samples = getattr(self.args, "fully_async_max_execution_samples", None)
         retained_groups = getattr(self.args, "fully_async_max_retained_groups", None)
         completed_groups = getattr(self.args, "fully_async_max_completed_prefetch_groups", None)
@@ -523,6 +547,27 @@ class FullyAsyncRolloutFn:
             return await drain_task
         finally:
             self._active_drains.discard(drain_task)
+
+    async def prepare_checkpoint(self, rollout_id: int) -> None:
+        """Prepare rollout-owned state for checkpoint publication.
+
+        Args:
+            rollout_id: Rollout identifier that the checkpoint will publish.
+        """
+        if self._closing:
+            raise RuntimeError("Fully async rollout function is closed.")
+        if not self._train_admission_holds:
+            raise RuntimeError("Checkpoint preparation requires an active train admission hold.")
+        if self._open_train_batch_leases:
+            open_rollout_ids = sorted(lease.rollout_id for lease in self._open_train_batch_leases)
+            raise RuntimeError(
+                f"Cannot prepare checkpoint {rollout_id} with open train batch leases: {open_rollout_ids}."
+            )
+        pending_rollback_error = self._retry_pending_terminal_rollbacks()
+        if pending_rollback_error is not None:
+            raise pending_rollback_error
+        if self._worker_error is not None:
+            raise self._worker_error
 
     async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
         """Close training admission and return its owned claim."""
@@ -596,6 +641,17 @@ class FullyAsyncRolloutFn:
                 self._strict_weight_version = current
             return self._strict_weight_version, True
 
+    def _settle_train_batch_lease(self, lease: TrainBatchLease) -> None:
+        if lease not in self._open_train_batch_leases:
+            raise RuntimeError(f"Train batch lease for rollout {lease.rollout_id} is not open.")
+        self._open_train_batch_leases.remove(lease)
+
+    def _retain_failed_train_batch_rollback(
+        self,
+        terminal_receipts: list[ReservationTerminalReceipt],
+    ) -> None:
+        self._pending_terminal_rollbacks.extend((terminal_receipt, True) for terminal_receipt in terminal_receipts)
+
     async def close(self) -> None:
         """Stop rollout production and settle every retained reservation.
 
@@ -630,6 +686,9 @@ class FullyAsyncRolloutFn:
         self._train_admission_holds.clear()
         self._train_admission_open.clear()
         self._train_batch_lease_admission_open.set()
+        if self._open_train_batch_leases:
+            open_rollout_ids = sorted(lease.rollout_id for lease in self._open_train_batch_leases)
+            raise RuntimeError(f"Cannot close fully async rollout with open train batch leases: {open_rollout_ids}.")
         cleanup_error: BaseException | None = None
         shutdown_error: BaseException | None = None
 
@@ -1592,18 +1651,22 @@ class FullyAsyncRolloutFn:
                 completed_slots = self._completed_slots
                 if ownership is None or completed_slots is None:
                     raise RuntimeError("Fully async ownership is not initialized.")
+                lease = _OwnedTrainBatchLease(
+                    rollout_id=rollout_id,
+                    ownership=ownership,
+                    terminal_receipts=terminal_receipts,
+                    retained_slots=self._retained_slots,
+                    completed_slots=completed_slots,
+                    completed_slot_available=self._completed_slot_available,
+                    owned_capacity_released=self._owned_capacity_released,
+                    on_settled=self._settle_train_batch_lease,
+                    on_rollback_failed=self._retain_failed_train_batch_rollback,
+                )
+                self._open_train_batch_leases.add(lease)
                 return LeasedRolloutFnTrainOutput(
                     samples=cast(list[list[Sample]], data),
                     metrics=metrics,
-                    lease=_OwnedTrainBatchLease(
-                        rollout_id=rollout_id,
-                        ownership=ownership,
-                        terminal_receipts=terminal_receipts,
-                        retained_slots=self._retained_slots,
-                        completed_slots=completed_slots,
-                        completed_slot_available=self._completed_slot_available,
-                        owned_capacity_released=self._owned_capacity_released,
-                    ),
+                    lease=lease,
                 )
             return RolloutFnTrainOutput(samples=data, metrics=metrics)
         except BaseException as error:

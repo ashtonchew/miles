@@ -104,15 +104,54 @@ class TrainAdmissionHold(ABC):
         """Implement release of this exact admission claim."""
 
 
+class RolloutFnLifecycle(ABC):
+    """Expose optional ownership and resource lifecycle controls."""
+
+    @abstractmethod
+    async def prepare_checkpoint(self, rollout_id: int) -> None:
+        """Prepare rollout-owned state for checkpoint publication.
+
+        The caller must own an active train-admission hold so no owned batch
+        lease can be issued while checkpoint publication is prepared.
+
+        Args:
+            rollout_id: Rollout identifier that the checkpoint will publish.
+
+        Raises:
+            RuntimeError: If no train-admission hold is active.
+            RuntimeError: If train-batch ownership remains unsettled.
+            BaseException: A rollout lifecycle failure.
+        """
+
+    @abstractmethod
+    async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+        """Close training admission and return its owned claim.
+
+        The return linearizes after every later source reservation and owned
+        train-batch lease issuance is blocked. Work admitted before that point
+        continues until terminal.
+        """
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close rollout-owned resources.
+
+        Repeated calls have no effect after a successful close. A failed close
+        may be retried when its reported ownership or cleanup blocker changes.
+        Close permanently dominates outstanding admission holds.
+        """
+
+
 class TrainBatchLease(ABC):
     """Own a rollout batch until its train-data handoff settles.
 
     Args:
         rollout_id: Training rollout that requested the batch.
 
-    A successful commit transfers ownership to downstream train data.
-    Settlement may be attempted only once, including when its implementation
-    raises.
+    A successful commit transfers ownership to downstream train data. A failed
+    commit must recover ownership or retain it for lifecycle cleanup because
+    the caller discards the failed handoff. Settlement may be attempted only
+    once, including when its implementation raises.
     """
 
     def __init__(self, rollout_id: int) -> None:
