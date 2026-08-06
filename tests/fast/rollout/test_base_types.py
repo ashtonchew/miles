@@ -23,6 +23,9 @@ class RecordingTrainAdmissionHold(TrainAdmissionHold):
     async def _wait_terminal(self) -> None:
         self._events.append("terminal")
 
+    def _record_weight_update(self) -> None:
+        self._events.append("weight_update")
+
     def _release(self) -> None:
         self._events.append("release")
 
@@ -59,6 +62,32 @@ async def test_train_admission_hold_releases_once() -> None:
         hold.release()
     assert str(repeated_release.value) == "Train admission hold already has a release attempt."
     assert events == ["release"]
+
+
+async def test_train_admission_hold_records_one_weight_update_after_terminal() -> None:
+    events: list[str] = []
+    hold = RecordingTrainAdmissionHold(events)
+
+    with pytest.raises(RuntimeError) as record_before_terminal:
+        hold.record_weight_update()
+    assert (
+        str(record_before_terminal.value)
+        == "Train admission hold must observe its terminal frontier before a weight update."
+    )
+
+    await hold.wait_terminal()
+    hold.record_weight_update()
+
+    assert events == ["terminal", "weight_update"]
+    with pytest.raises(RuntimeError) as repeated_record:
+        hold.record_weight_update()
+    assert str(repeated_record.value) == "Train admission hold already recorded a weight update."
+
+    hold.release()
+    with pytest.raises(RuntimeError) as record_after_release:
+        hold.record_weight_update()
+    assert str(record_after_release.value) == "Train admission hold already has a release attempt."
+    assert events == ["terminal", "weight_update", "release"]
 
 
 def test_leased_output_preserves_the_ordinary_train_output_contract() -> None:

@@ -64,6 +64,8 @@ class TrainAdmissionHold(ABC):
 
     def __init__(self) -> None:
         self._release_attempted = False
+        self._terminal_observed = False
+        self._weight_update_recorded = False
 
     async def wait_terminal(self) -> None:
         """Wait until every execution before this hold's frontier is terminal.
@@ -79,10 +81,35 @@ class TrainAdmissionHold(ABC):
         if self._release_attempted:
             raise RuntimeError("Train admission hold already has a release attempt.")
         await self._wait_terminal()
+        self._terminal_observed = True
 
     @abstractmethod
     async def _wait_terminal(self) -> None:
         """Implement terminal observation for this hold's admission frontier."""
+
+    def record_weight_update(self) -> None:
+        """Record a completed weight update while this hold owns admission.
+
+        Rollout functions that retain prefetched work can use this marker to
+        reject work admitted before the updated weights became visible.
+
+        Raises:
+            RuntimeError: If the terminal frontier has not completed.
+            RuntimeError: If this hold already recorded a weight update.
+            RuntimeError: If release was already attempted.
+        """
+        if self._release_attempted:
+            raise RuntimeError("Train admission hold already has a release attempt.")
+        if not self._terminal_observed:
+            raise RuntimeError("Train admission hold must observe its terminal frontier before a weight update.")
+        if self._weight_update_recorded:
+            raise RuntimeError("Train admission hold already recorded a weight update.")
+        self._record_weight_update()
+        self._weight_update_recorded = True
+
+    @abstractmethod
+    def _record_weight_update(self) -> None:
+        """Apply a completed weight-update marker to rollout-owned state."""
 
     def release(self) -> None:
         """Release this hold's claim on training admission.

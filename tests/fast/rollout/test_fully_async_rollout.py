@@ -21,6 +21,7 @@ from miles.rollout.base_types import (
     RolloutFnEvalInput,
     RolloutFnLifecycle,
     RolloutFnTrainInput,
+    RolloutFnTrainOutput,
     TrainBatchRollbackReason,
 )
 from miles.rollout.data_source import SourceReservation, SourceReservationId
@@ -188,6 +189,7 @@ class FakeWeightVersion:
         self.value = value
         self.requests = 0
         self.refreshes = 0
+        self.invalidations = 0
 
     async def get(self, args) -> int | None:
         self.requests += 1
@@ -196,6 +198,9 @@ class FakeWeightVersion:
     async def refresh(self, args) -> int | None:
         self.refreshes += 1
         return await self.get(args)
+
+    def invalidate(self) -> None:
+        self.invalidations += 1
 
 
 def make_fn(monkeypatch, args, data_source, generate=None):
@@ -866,8 +871,18 @@ async def test_cancelled_train_waiter_does_not_consume_next_completed_group(monk
 async def test_legacy_claimed_group_survives_output_queue_refill(monkeypatch):
     first_group = make_group(52)
     second_group = make_group(53)
-    first_buffered_group = (first_group, first_group)
-    second_buffered_group = (second_group, second_group)
+    first_completed = fully_async._LegacyCompletedGroup(
+        source_samples=first_group,
+        samples=first_group,
+        weight_update_epoch=0,
+    )
+    second_completed = fully_async._LegacyCompletedGroup(
+        source_samples=second_group,
+        samples=second_group,
+        weight_update_epoch=0,
+    )
+    first_buffered_group = (first_completed, first_completed.samples)
+    second_buffered_group = (second_completed, second_completed.samples)
     fn = make_fn(monkeypatch, make_args(), FakeDataSource())
     output = fully_async.DataBuffer(
         order="fifo",
@@ -923,6 +938,7 @@ async def test_worker_failure_wins_when_output_queue_completes_in_the_same_wait(
         terminal_receipt=terminal_receipt,
         samples=list(reservation.samples),
         expected_parent_identities=tuple((sample.group_index, sample.index) for sample in reservation.samples),
+        weight_update_epoch=0,
     )
     await output.put((completed, completed.samples))
     fn._output = output
@@ -1093,9 +1109,19 @@ async def test_close_recycles_unconsumed_legacy_active_and_prefetched_groups(mon
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
     )
-    await output.put((prefetched_group, prefetched_group))
+    prefetched = fully_async._LegacyCompletedGroup(
+        source_samples=prefetched_group,
+        samples=prefetched_group,
+        weight_update_epoch=0,
+    )
+    claimed = fully_async._LegacyCompletedGroup(
+        source_samples=claimed_group,
+        samples=claimed_group,
+        weight_update_epoch=0,
+    )
+    await output.put((prefetched, prefetched.samples))
     fn._output = output
-    fn._legacy_requeued_groups.append((claimed_group, claimed_group))
+    fn._legacy_requeued_groups.append((claimed, claimed.samples))
     fn._submit_one_group()
     fn._submit_one_group()
     await all_started.wait()
@@ -1119,7 +1145,12 @@ async def test_close_recycles_legacy_group_blocked_on_output_put(monkeypatch):
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
     )
-    await output.put((prefetched_group, prefetched_group))
+    prefetched = fully_async._LegacyCompletedGroup(
+        source_samples=prefetched_group,
+        samples=prefetched_group,
+        weight_update_epoch=0,
+    )
+    await output.put((prefetched, prefetched.samples))
     fn._output = output
     fn._worker = asyncio.create_task(fn._worker_loop())
     await wait_until(lambda: data_source.num_get_calls == 1 and not fn._legacy_executions)
@@ -1191,7 +1222,12 @@ async def test_close_retries_failed_legacy_recycle(monkeypatch):
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
     )
-    await output.put((prefetched_group, prefetched_group))
+    prefetched = fully_async._LegacyCompletedGroup(
+        source_samples=prefetched_group,
+        samples=prefetched_group,
+        weight_update_epoch=0,
+    )
+    await output.put((prefetched, prefetched.samples))
     fn._output = output
 
     with pytest.raises(RuntimeError) as first_close_error:
@@ -2038,6 +2074,146 @@ async def test_legacy_admission_hold_does_not_wait_for_saturated_buffer_publicat
         await fn.close()
 
 
+async def test_recorded_weight_update_recycles_legacy_prefetch_from_prior_epoch(monkeypatch):
+    data_source = FakeDataSource()
+    generation_releases: asyncio.Queue[None] = asyncio.Queue()
+    current_weight_version = 1
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        await generation_releases.get()
+        for sample in group:
+            sample.weight_versions = [str(current_weight_version)]
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=1),
+        data_source,
+        generate=generate,
+    )
+    first_train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=68)))
+    await wait_until(lambda: data_source.num_get_calls == 1)
+    generation_releases.put_nowait(None)
+    first = await asyncio.wait_for(first_train, timeout=1)
+    assert first.samples == [make_group(1001, weight_versions=["1"])]
+
+    await wait_until(lambda: data_source.num_get_calls == 2)
+    generation_releases.put_nowait(None)
+    assert fn._output is not None
+    await wait_until(lambda: fn._output.qsize() == 1)
+    await wait_until(lambda: data_source.num_get_calls == 3)
+
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+    generation_releases.put_nowait(None)
+    await terminal
+    current_weight_version = 2
+    hold.record_weight_update()
+    hold.release()
+
+    second_train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=69)))
+    await wait_until(lambda: data_source.num_get_calls == 4)
+    generation_releases.put_nowait(None)
+    second = await asyncio.wait_for(second_train, timeout=1)
+
+    expected_recycled = [
+        make_group(1002, weight_versions=["1"]),
+        make_group(1003, weight_versions=["1"]),
+    ]
+    for group in expected_recycled:
+        for sample in group:
+            sample.reset_for_retry()
+    assert second == RolloutFnTrainOutput(
+        samples=[make_group(1004, weight_versions=["2"])],
+        metrics={
+            "rollout/fully_async/queue_size": 0,
+            "rollout/fully_async/aborted_groups_recycled": 0,
+            "rollout/fully_async/stale_groups_recycled": 2,
+            "rollout/fully_async/evicted_stale_groups": 0,
+            "rollout/fully_async/evicted_overflow_groups": 0,
+            "rollout/fully_async/evict_rate": 0.0,
+        },
+    )
+    assert data_source.recycled == expected_recycled
+
+    await fn.close()
+
+
+async def test_recorded_weight_update_recycles_legacy_group_already_accepted_by_drain(monkeypatch):
+    data_source = FakeDataSource()
+    first_generation_started = asyncio.Event()
+    release_first_generation = asyncio.Event()
+    block_later_prefetch = asyncio.Event()
+    current_weight_version = 1
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        if group_index == 1001:
+            first_generation_started.set()
+            await release_first_generation.wait()
+        elif group_index > 1003:
+            await block_later_prefetch.wait()
+        for sample in group:
+            sample.weight_versions = [str(current_weight_version)]
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=2,
+            async_max_concurrent_samples=N_SAMPLES_PER_PROMPT,
+        ),
+        data_source,
+        generate=generate,
+    )
+    original_next_group = fn._next_group
+    next_group_calls = 0
+    waiting_for_second_group = asyncio.Event()
+
+    async def next_group():
+        nonlocal next_group_calls
+        next_group_calls += 1
+        if next_group_calls == 2:
+            waiting_for_second_group.set()
+        return await original_next_group()
+
+    monkeypatch.setattr(fn, "_next_group", next_group)
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=70)))
+    await first_generation_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+
+    release_first_generation.set()
+    await hold.wait_terminal()
+    await waiting_for_second_group.wait()
+    assert train.done() is False
+
+    current_weight_version = 2
+    hold.record_weight_update()
+    hold.release()
+    output = await asyncio.wait_for(train, timeout=1)
+
+    expected_recycled = make_group(1001, weight_versions=["1"])
+    for sample in expected_recycled:
+        sample.reset_for_retry()
+    assert output == RolloutFnTrainOutput(
+        samples=[
+            make_group(1002, weight_versions=["2"]),
+            make_group(1003, weight_versions=["2"]),
+        ],
+        metrics={
+            "rollout/fully_async/queue_size": 0,
+            "rollout/fully_async/aborted_groups_recycled": 0,
+            "rollout/fully_async/stale_groups_recycled": 1,
+            "rollout/fully_async/evicted_stale_groups": 0,
+            "rollout/fully_async/evicted_overflow_groups": 0,
+            "rollout/fully_async/evict_rate": 0.0,
+        },
+    )
+    assert data_source.recycled == [expected_recycled]
+
+    await fn.close()
+
+
 async def test_legacy_terminal_frontier_reports_the_canonical_worker_failure(monkeypatch):
     first_group = make_group(72)
     second_group = make_group(73)
@@ -2193,6 +2369,177 @@ async def test_train_admission_hold_fences_lease_during_buffer_metric_read(monke
     await fn.close()
 
 
+async def test_train_admission_hold_recycles_completed_prefetch_from_prior_epoch(monkeypatch):
+    reservations = [make_reservation(index) for index in range(77, 80)]
+    data_source = FakeReservationDataSource(reservations)
+    current_weight_version = 1
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        for sample in group:
+            sample.weight_versions = [str(current_weight_version)]
+        return group
+
+    fn = make_owned_fn(monkeypatch, data_source, generate)
+    first = await fn(RolloutFnTrainInput(rollout_id=77))
+    first.lease.commit()
+    assert fn._output is not None
+    await wait_until(lambda: fn._output.qsize() == 1)
+
+    hold = await fn.acquire_train_admission_hold()
+    await hold.wait_terminal()
+    current_weight_version = 2
+    hold.record_weight_update()
+    hold.release()
+
+    second = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=78)), timeout=1)
+    cleanup_hold = await fn.acquire_train_admission_hold()
+    second.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await cleanup_hold.wait_terminal()
+    await fn.close()
+
+    assert second == LeasedRolloutFnTrainOutput(
+        samples=[make_group(79, weight_versions=["2"])],
+        metrics={
+            "rollout/fully_async/queue_size": 0,
+            "rollout/fully_async/aborted_groups_recycled": 0,
+            "rollout/fully_async/stale_groups_recycled": 1,
+            "rollout/fully_async/evicted_stale_groups": 0,
+            "rollout/fully_async/evicted_overflow_groups": 0,
+            "rollout/fully_async/evict_rate": 0.0,
+        },
+        lease=second.lease,
+    )
+    assert data_source.acknowledged == [([reservations[0]], 77)]
+    assert data_source.requeued == [[reservations[1]], [reservations[2]]]
+
+
+async def test_recorded_weight_update_invalidates_cached_numeric_staleness(monkeypatch):
+    reservations = [make_reservation(index) for index in range(80, 83)]
+    data_source = FakeReservationDataSource(reservations)
+    current_weight_version = 1
+    weight_version_requests: list[str] = []
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        for sample in group:
+            sample.weight_versions = [str(current_weight_version)]
+        return group
+
+    async def get(url: str) -> dict[str, str]:
+        weight_version_requests.append(url)
+        return {"weight_version": str(current_weight_version)}
+
+    monkeypatch.setattr(fully_async, "get", get)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        max_weight_staleness=0,
+    )
+    fn._weight_version = fully_async._CachedWeightVersion()
+    first = await fn(RolloutFnTrainInput(rollout_id=80))
+    first.lease.commit()
+    assert fn._output is not None
+    await wait_until(lambda: fn._output.qsize() == 1)
+
+    hold = await fn.acquire_train_admission_hold()
+    await hold.wait_terminal()
+    current_weight_version = 2
+    hold.record_weight_update()
+    hold.release()
+
+    second = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=81)), timeout=1)
+    cleanup_hold = await fn.acquire_train_admission_hold()
+    second.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await cleanup_hold.wait_terminal()
+    await fn.close()
+
+    assert second == LeasedRolloutFnTrainOutput(
+        samples=[make_group(82, weight_versions=["2"])],
+        metrics={
+            "rollout/fully_async/queue_size": 0,
+            "rollout/fully_async/aborted_groups_recycled": 0,
+            "rollout/fully_async/stale_groups_recycled": 1,
+            "rollout/fully_async/evicted_stale_groups": 0,
+            "rollout/fully_async/evicted_overflow_groups": 0,
+            "rollout/fully_async/evict_rate": 0.0,
+            "rollout/fully_async/avg_staleness": 1 / 3,
+            "rollout/fully_async/max_staleness": 1,
+        },
+        lease=second.lease,
+    )
+    assert data_source.acknowledged == [([reservations[0]], 80)]
+    assert data_source.requeued == [[reservations[1]], [reservations[2]]]
+    assert weight_version_requests == [
+        "http://127.0.0.1:30000/model_info",
+        "http://127.0.0.1:30000/model_info",
+        "http://127.0.0.1:30000/model_info",
+    ]
+
+
+async def test_numeric_staleness_accepts_prior_epoch_within_tolerance(monkeypatch):
+    reservations = [make_reservation(index) for index in range(83, 86)]
+    data_source = FakeReservationDataSource(reservations)
+    current_weight_version = 1
+    weight_version_requests: list[str] = []
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        for sample in group:
+            sample.weight_versions = [str(current_weight_version)]
+        return group
+
+    async def get(url: str) -> dict[str, str]:
+        weight_version_requests.append(url)
+        return {"weight_version": str(current_weight_version)}
+
+    monkeypatch.setattr(fully_async, "get", get)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        max_weight_staleness=1,
+    )
+    fn._weight_version = fully_async._CachedWeightVersion()
+    first = await fn(RolloutFnTrainInput(rollout_id=83))
+    first.lease.commit()
+    assert fn._output is not None
+    await wait_until(lambda: fn._output.qsize() == 1)
+
+    hold = await fn.acquire_train_admission_hold()
+    await hold.wait_terminal()
+    current_weight_version = 2
+    hold.record_weight_update()
+    hold.release()
+
+    second = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=84)), timeout=1)
+    second.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    cleanup_hold = await fn.acquire_train_admission_hold()
+    await cleanup_hold.wait_terminal()
+    await fn.close()
+
+    assert second == LeasedRolloutFnTrainOutput(
+        samples=[make_group(84, weight_versions=["1"])],
+        metrics={
+            "rollout/fully_async/queue_size": 0,
+            "rollout/fully_async/aborted_groups_recycled": 0,
+            "rollout/fully_async/stale_groups_recycled": 0,
+            "rollout/fully_async/evicted_stale_groups": 0,
+            "rollout/fully_async/evicted_overflow_groups": 0,
+            "rollout/fully_async/evict_rate": 0.0,
+            "rollout/fully_async/avg_staleness": 1.0,
+            "rollout/fully_async/max_staleness": 1,
+        },
+        lease=second.lease,
+    )
+    assert data_source.acknowledged == [([reservations[0]], 83)]
+    assert data_source.reserved == reservations[:2]
+    assert data_source.requeued == [[reservations[1]]]
+    assert weight_version_requests == [
+        "http://127.0.0.1:30000/model_info",
+        "http://127.0.0.1:30000/model_info",
+        "http://127.0.0.1:30000/model_info",
+    ]
+
+
 async def test_train_admission_hold_revalidates_staleness_before_issuing_a_lease(monkeypatch):
     reservation = SourceReservation(
         reservation_id=SourceReservationId("source-76"),
@@ -2225,6 +2572,7 @@ async def test_train_admission_hold_revalidates_staleness_before_issuing_a_lease
     # group under this hold's admission epoch before releasing the hold.
     await wait_until(lambda: weight_version.requests >= 2)
     weight_version.value = 2
+    hold.record_weight_update()
     hold.release()
     output = await asyncio.wait_for(train, timeout=1)
 
@@ -2244,6 +2592,7 @@ async def test_train_admission_hold_revalidates_staleness_before_issuing_a_lease
     )
     assert data_source.requeued == [[reservation]]
     assert weight_version.refreshes == 1
+    assert weight_version.invalidations == 1
 
     fresh_reservation = data_source.reserved[1]
     output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
@@ -2369,6 +2718,7 @@ async def test_concurrent_drains_revalidate_their_groups_against_the_strict_epoc
             terminal_receipt=terminal_receipt,
             samples=list(reserved.samples),
             expected_parent_identities=tuple((sample.group_index, sample.index) for sample in reserved.samples),
+            weight_update_epoch=0,
         )
         await output.put((completed, completed.samples))
     fn._output = output
@@ -3814,6 +4164,43 @@ async def test_weight_version_refresh_cannot_be_poisoned_by_older_query(monkeypa
 
     assert (older_result, refresh_result, cached_result, calls) == (
         1,
+        2,
+        2,
+        [
+            "http://127.0.0.1:30000/model_info",
+            "http://127.0.0.1:30000/model_info",
+        ],
+    )
+
+
+@pytest.mark.parametrize("use_refresh", [False, True])
+async def test_weight_version_invalidation_retries_in_flight_query(monkeypatch, use_refresh: bool):
+    first_query_started = asyncio.Event()
+    release_first_query = asyncio.Event()
+    calls: list[str] = []
+
+    async def reordered_router(url: str) -> dict[str, str]:
+        calls.append(url)
+        if len(calls) == 1:
+            first_query_started.set()
+            await release_first_query.wait()
+            return {"weight_version": "1"}
+        return {"weight_version": "2"}
+
+    monkeypatch.setattr(fully_async, "get", reordered_router)
+    args = make_args()
+    weight_version = fully_async._CachedWeightVersion(ttl=60.0)
+
+    query = weight_version.refresh(args) if use_refresh else weight_version.get(args)
+    older_query = asyncio.create_task(query)
+    await first_query_started.wait()
+    weight_version.invalidate()
+    release_first_query.set()
+
+    older_result = await older_query
+    cached_result = await weight_version.get(args)
+
+    assert (older_result, cached_result, calls) == (
         2,
         2,
         [
