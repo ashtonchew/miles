@@ -19,9 +19,8 @@ rollout engines, pausing producer submissions for the duration of the
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import cast
 
@@ -39,7 +38,15 @@ from miles.rollout.base_types import (
     TrainBatchRollbackReason,
 )
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.fully_async.execution import (
+    FullyAsyncExecution,
+    FullyAsyncExecutionFailure,
+    FullyAsyncExecutionRetry,
+    FullyAsyncExecutionSuccess,
+    FullyAsyncRetryReason,
+)
 from miles.rollout.fully_async.ownership import ReservationOwnership, ReservationStageId, ReservationTerminalReceipt
+from miles.rollout.inference_rollout.fully_async import InferenceFullyAsyncExecutor
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.submission_scheduler import make_submission_scheduler
@@ -56,6 +63,7 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # A finished group is list[Sample], or list[list[Sample]] when a generate function
 # returns multiple samples per trajectory (e.g. multi-agent).
 Group = list[Sample | list[Sample]]
+LegacyBufferedGroup = tuple[list[Sample], Group]
 
 
 @dataclass(frozen=True)
@@ -68,12 +76,28 @@ class _OwnedCompletedGroup:
 @dataclass(frozen=True)
 class _OwnedExecutionFailure:
     terminal_receipt: ReservationTerminalReceipt
-    error: Exception
+    error: BaseException
+
+
+@dataclass(frozen=True)
+class _OwnedExecutionRetry:
+    terminal_receipt: ReservationTerminalReceipt
+    reason: FullyAsyncRetryReason
+
+
+_OwnedTerminalResult = _OwnedCompletedGroup | _OwnedExecutionRetry | _OwnedExecutionFailure
+_OwnedTerminalObserver = Callable[[], Coroutine[object, object, _OwnedTerminalResult]]
+_WorkerResult = LegacyBufferedGroup | _OwnedTerminalResult
+
+
+@dataclass(frozen=True)
+class _ActiveOwnedExecution:
+    execution: FullyAsyncExecution
+    observe_terminal: _OwnedTerminalObserver
 
 
 BufferSource = list[Sample] | _OwnedCompletedGroup
 BufferEntry = tuple[BufferSource, Group]
-LegacyBufferedGroup = tuple[list[Sample], Group]
 
 
 class _OwnedTrainBatchLease(TrainBatchLease):
@@ -363,6 +387,19 @@ class FullyAsyncRolloutFn:
         )
         self._completed_groups = cast(int, completed_groups) if self._uses_owned_capacity else None
         self._ownership = ReservationOwnership(self.data_source) if self._uses_owned_capacity else None
+        self._executor = (
+            InferenceFullyAsyncExecutor(
+                self.state,
+                sample_done_callback=self._scheduler.sample_done_callback,
+            )
+            if self._uses_owned_capacity
+            else None
+        )
+        self._active_executions: dict[
+            asyncio.Task[_OwnedTerminalResult],
+            _ActiveOwnedExecution,
+        ] = {}
+        self._pending_aborted_groups_recycled = 0
         self._next_execution_id = 1
         self._completed_slots: asyncio.Queue[object] | None = None
         self._completed_slot_available = asyncio.Event()
@@ -443,7 +480,7 @@ class FullyAsyncRolloutFn:
 
     def _submit_one_group(
         self,
-    ) -> asyncio.Task[LegacyBufferedGroup | _OwnedCompletedGroup | _OwnedExecutionFailure]:
+    ) -> asyncio.Task[_WorkerResult]:
         if not self._uses_owned_capacity:
             prompt_groups = self.data_source.get_samples(1)
             self._scheduler.on_submit(prompt_groups)
@@ -483,30 +520,61 @@ class FullyAsyncRolloutFn:
                     f"Source reservation {reservation.reservation_id} has duplicate parent identities: "
                     f"{list(expected_parent_identities)}."
                 )
-            group = deepcopy(list(reservation.samples))
             stage_id = ReservationStageId(f"execution-{self._next_execution_id}")
             self._next_execution_id += 1
             [executor_receipt] = ownership.begin_execution([reservation], stage_id=stage_id)
-            self._scheduler.on_submit([group])
         except Exception:
             ownership.rollback_reserved([reservation])
             retained_slots.release()
             raise
 
-        async def execute() -> Group | _OwnedCompletedGroup | _OwnedExecutionFailure:
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError("Fully async executor is not initialized.")
+        try:
+            execution = executor.submit(reservation, executor_receipt)
+        except BaseException as submission_error:
             try:
-                samples = await self._generate_group(group)
-            except Exception as error:
                 [terminal_receipt] = ownership.record_terminal([executor_receipt], stage_id=stage_id)
-                return _OwnedExecutionFailure(terminal_receipt=terminal_receipt, error=error)
+            except BaseException as terminal_error:
+                raise submission_error from terminal_error
+            try:
+                ownership.rollback_batch([terminal_receipt])
+            except BaseException as settlement_error:
+                raise submission_error from settlement_error
+            retained_slots.release()
+            raise
+        self._scheduler.on_submit([list(reservation.samples)])
+
+        async def observe_terminal() -> _OwnedTerminalResult:
+            outcome = await execution.wait_terminal()
+            if outcome.executor_receipt is not executor_receipt:
+                # A foreign receipt cannot prove this reservation terminal; retain ownership fail-closed.
+                raise RuntimeError(
+                    f"Execution receipt {executor_receipt.receipt_id} did not return its exact terminal receipt."
+                )
             [terminal_receipt] = ownership.record_terminal([executor_receipt], stage_id=stage_id)
+            if isinstance(outcome, FullyAsyncExecutionFailure):
+                return _OwnedExecutionFailure(terminal_receipt=terminal_receipt, error=outcome.error)
+            if isinstance(outcome, FullyAsyncExecutionRetry):
+                return _OwnedExecutionRetry(
+                    terminal_receipt=terminal_receipt,
+                    reason=outcome.reason,
+                )
+            if not isinstance(outcome, FullyAsyncExecutionSuccess):
+                raise RuntimeError(f"Fully async execution returned unsupported {type(outcome).__name__}.")
             return _OwnedCompletedGroup(
                 terminal_receipt=terminal_receipt,
-                samples=samples,
+                samples=outcome.samples,
                 expected_parent_identities=expected_parent_identities,
             )
 
-        return asyncio.create_task(execute())
+        terminal_task = asyncio.create_task(observe_terminal())
+        self._active_executions[terminal_task] = _ActiveOwnedExecution(
+            execution=execution,
+            observe_terminal=observe_terminal,
+        )
+        return terminal_task
 
     async def _acquire_retained_slot(self) -> bool:
         if self._retained_slots is None:
@@ -519,7 +587,7 @@ class FullyAsyncRolloutFn:
 
     async def _submit_active_group(
         self,
-        active: set[asyncio.Task[LegacyBufferedGroup | _OwnedCompletedGroup | _OwnedExecutionFailure]],
+        active: set[asyncio.Task[_WorkerResult]],
     ) -> bool:
         if self._uses_owned_capacity:
             retained_slot_acquired = await self._acquire_retained_slot()
@@ -623,9 +691,10 @@ class FullyAsyncRolloutFn:
         output = self._output
         if output is None:
             raise RuntimeError("Fully async output buffer is not initialized.")
-        active: set[asyncio.Task[LegacyBufferedGroup | _OwnedCompletedGroup | _OwnedExecutionFailure]] = set()
-        fatal_error: Exception | None = None
-        fatal_settlement_error: Exception | None = None
+        active: set[asyncio.Task[_WorkerResult]] = set()
+        cancellation_requested: set[asyncio.Task[_OwnedTerminalResult]] = set()
+        fatal_error: BaseException | None = None
+        fatal_settlement_error: BaseException | None = None
         while True:
             scheduler_blocked = False
             ownership_blocked = False
@@ -663,6 +732,28 @@ class FullyAsyncRolloutFn:
                 queued_settlement_error = await self._rollback_queued_owned_groups(output)
                 if fatal_settlement_error is None:
                     fatal_settlement_error = queued_settlement_error
+                cancellation_error: BaseException | None = None
+                if self._uses_owned_capacity:
+                    for task in active:
+                        owned_task = cast(asyncio.Task[_OwnedTerminalResult], task)
+                        if owned_task in cancellation_requested:
+                            continue
+                        active_execution = self._active_executions.get(owned_task)
+                        if active_execution is None:
+                            if cancellation_error is None:
+                                cancellation_error = RuntimeError(
+                                    "Fully async worker lost an active execution record."
+                                )
+                            continue
+                        try:
+                            active_execution.execution.request_cancellation()
+                        except BaseException as error:
+                            if cancellation_error is None:
+                                cancellation_error = error
+                        else:
+                            cancellation_requested.add(owned_task)
+                if cancellation_error is not None:
+                    raise fatal_error from cancellation_error
             if not active:
                 if fatal_error is not None:
                     if fatal_settlement_error is not None:
@@ -704,11 +795,23 @@ class FullyAsyncRolloutFn:
                     version = await self._weight_version.get(self.args)
                     await output.put(result, current_version=version)
                     continue
+                owned_task = cast(asyncio.Task[_OwnedTerminalResult], task)
                 try:
-                    result = task.result()
-                except Exception as task_error:
+                    result = owned_task.result()
+                except BaseException as task_error:
                     if fatal_error is None:
                         fatal_error = task_error
+                    continue
+                if isinstance(result, _OwnedExecutionRetry):
+                    try:
+                        self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=False)
+                    except Exception as settlement_error:
+                        if fatal_error is None:
+                            fatal_error = settlement_error
+                    else:
+                        if result.reason is FullyAsyncRetryReason.EXECUTION_ABORTED:
+                            self._pending_aborted_groups_recycled += 1
+                    self._active_executions.pop(owned_task, None)
                     continue
                 if isinstance(result, _OwnedExecutionFailure):
                     try:
@@ -718,6 +821,7 @@ class FullyAsyncRolloutFn:
                             fatal_settlement_error = settlement_error
                     if fatal_error is None:
                         fatal_error = result.error
+                    self._active_executions.pop(owned_task, None)
                     continue
                 if not isinstance(result, _OwnedCompletedGroup):
                     raise RuntimeError(f"Owned fully async execution returned unsupported {type(result).__name__}.")
@@ -729,6 +833,7 @@ class FullyAsyncRolloutFn:
                             fatal_error = settlement_error
                         elif fatal_settlement_error is None:
                             fatal_settlement_error = settlement_error
+                    self._active_executions.pop(owned_task, None)
                     continue
                 try:
                     version = await self._weight_version.get(self.args)
@@ -740,12 +845,15 @@ class FullyAsyncRolloutFn:
                             fatal_settlement_error = settlement_error
                     if fatal_error is None:
                         fatal_error = version_error
+                    self._active_executions.pop(owned_task, None)
                     continue
                 try:
                     await output.put((result, result.samples), current_version=version)
                 except Exception as buffer_error:
                     if fatal_error is None:
                         fatal_error = buffer_error
+                else:
+                    self._active_executions.pop(owned_task, None)
 
     # -------------------------- consumer --------------------------
 
@@ -879,6 +987,8 @@ class FullyAsyncRolloutFn:
             if self._sample_filter is not None:
                 self._sample_filter(args, data)
 
+            aborted_groups_recycled += self._pending_aborted_groups_recycled
+            self._pending_aborted_groups_recycled = 0
             metrics = {
                 "rollout/fully_async/queue_size": output.qsize(),
                 "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,

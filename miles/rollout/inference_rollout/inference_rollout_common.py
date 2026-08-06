@@ -4,7 +4,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 from miles.rollout.base_types import (
     GenerateFnInput,
@@ -130,6 +130,9 @@ async def generate_and_rm_group(
     args = state.args
 
     if state.aborted:
+        if sample_done_callback is not None:
+            for _ in group:
+                sample_done_callback()
         return group
 
     if policy_uses_routing_key(args):
@@ -139,7 +142,7 @@ async def generate_and_rm_group(
 
     log_prefix = f"[group indices={[getattr(s, 'index', '?') for s in group]}]"
     logger.debug(f"{log_prefix} Starting group with {len(group)} samples")
-    tasks = []
+    tasks: list[asyncio.Task[Sample | list[Sample]]] = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
@@ -150,15 +153,23 @@ async def generate_and_rm_group(
             task.add_done_callback(lambda _task: sample_done_callback())
         tasks.append(task)
 
-    try:
-        group = await asyncio.gather(*tasks)
-    except BaseException:
-        # cancel siblings and let them settle: the group returns only after every
-        # sample task is done, so no orphan generation or in-flight credit outlives it
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    terminal_wait = asyncio.gather(*tasks, return_exceptions=True)
+    cancellation: asyncio.CancelledError | None = None
+    while not terminal_wait.done():
+        try:
+            await asyncio.shield(terminal_wait)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+    results = terminal_wait.result()
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if cancellation is not None:
+        if errors:
+            raise cancellation from errors[0]
+        raise cancellation
+    if errors:
+        raise errors[0]
+    group = cast(list[Sample], [task.result() for task in tasks])
     logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
     if state.aborted:
         return group

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 import miles.rollout.fully_async_rollout as fully_async
+import miles.rollout.inference_rollout.fully_async as inference_fully_async
 from miles.rollout.base_types import (
     LeasedRolloutFnTrainOutput,
     RolloutFnConstructorInput,
@@ -22,6 +23,8 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.data_source import SourceReservation, SourceReservationId
 from miles.rollout.filter_hub.base_types import DynamicFilterOutput
+from miles.rollout.fully_async.execution import FullyAsyncExecutionSuccess
+from miles.rollout.fully_async.ownership import ReservationExecutorReceipt
 from miles.utils.async_utils import AsyncLoopThread
 from miles.utils.types import Sample
 
@@ -149,6 +152,7 @@ def make_args(**overrides) -> Namespace:
         async_data_buffer_order="fifo",
         dynamic_sampling_filter_path=None,
         rollout_sample_filter_path=None,
+        rollout_health_check_timeout=0.1,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
         eval_num_gpus=0,
@@ -172,6 +176,7 @@ def make_fn(monkeypatch, args, data_source, generate=None):
 
     monkeypatch.setattr(fully_async, "GenerateState", FakeGenerateState)
     monkeypatch.setattr(fully_async, "generate_and_rm_group", generate or default_generate)
+    monkeypatch.setattr(inference_fully_async, "generate_and_rm_group", generate or default_generate)
     fn = fully_async.FullyAsyncRolloutFn(RolloutFnConstructorInput(args=args, data_source=data_source))
     # Staleness accounting queries the router on every drain; fake it out.
     fn._weight_version = FakeWeightVersion()
@@ -215,7 +220,7 @@ async def test_train_call_leases_one_to_many_output_by_parent_group(monkeypatch)
     generated_group = [[first_child, second_child], completed_second_parent]
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         assert [(sample.group_index, sample.index) for sample in group] == [(1, 10), (1, 11)]
         return generated_group
 
@@ -249,7 +254,7 @@ async def test_owned_admission_rejects_missing_parent_identity(monkeypatch):
     reservation.samples[0].index = None
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         raise AssertionError("generation must not start for an invalid source reservation")
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -269,7 +274,7 @@ async def test_owned_admission_rejects_duplicate_parent_identities(monkeypatch):
     reservation.samples[1].index = reservation.samples[0].index
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         raise AssertionError("generation must not start for an invalid source reservation")
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -291,7 +296,7 @@ async def test_terminal_failure_requeues_exact_source_reservation(monkeypatch):
     data_source = FakeReservationDataSource([reservation])
     failure = RuntimeError("generation failed")
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         raise failure
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -304,15 +309,55 @@ async def test_terminal_failure_requeues_exact_source_reservation(monkeypatch):
     assert data_source.requeued == [[reservation]]
 
 
+async def test_mismatched_execution_receipt_retains_ownership_fail_closed(monkeypatch):
+    reservation = make_reservation(50)
+    data_source = FakeReservationDataSource([reservation])
+
+    class MismatchedReceiptExecution:
+        def __init__(self, executor_receipt: ReservationExecutorReceipt) -> None:
+            self.executor_receipt = executor_receipt
+
+        def request_cancellation(self) -> None:
+            raise AssertionError("terminal execution must not be cancelled")
+
+        async def wait_terminal(self) -> FullyAsyncExecutionSuccess:
+            return FullyAsyncExecutionSuccess(
+                executor_receipt=replace(self.executor_receipt),
+                samples=[deepcopy(sample) for sample in reservation.samples],
+            )
+
+    fn = make_owned_fn(monkeypatch, data_source)
+    assert fn._executor is not None
+
+    def submit(
+        source_reservation: SourceReservation,
+        executor_receipt: ReservationExecutorReceipt,
+    ) -> MismatchedReceiptExecution:
+        assert source_reservation is reservation
+        return MismatchedReceiptExecution(executor_receipt)
+
+    monkeypatch.setattr(fn._executor, "submit", submit)
+
+    with pytest.raises(RuntimeError) as error:
+        await fn(RolloutFnTrainInput(rollout_id=50))
+
+    assert str(error.value) == "Execution receipt 0 did not return its exact terminal receipt."
+    assert data_source.reserved == [reservation]
+    assert data_source.acknowledged == []
+    assert data_source.requeued == []
+    assert len(fn._active_executions) == 1
+
+
 async def test_terminal_failure_drains_and_requeues_active_siblings(monkeypatch):
     reservations = [make_reservation(index) for index in range(26, 29)]
     data_source = FakeReservationDataSource(reservations)
     all_started = asyncio.Event()
     release_successes = asyncio.Event()
+    abort_requested = asyncio.Event()
     started: list[int] = []
     failure = RuntimeError("generation failed")
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         group_index = group[0].group_index
         started.append(group_index)
         if len(started) == 3:
@@ -323,14 +368,22 @@ async def test_terminal_failure_drains_and_requeues_active_siblings(monkeypatch)
         await release_successes.wait()
         return group
 
+    async def request_abort(args) -> None:
+        abort_requested.set()
+
+    monkeypatch.setattr(inference_fully_async, "request_abort", request_abort)
     fn = make_owned_fn(monkeypatch, data_source, generate, execution_samples=6, retained_groups=3)
     drain = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=26)))
     await all_started.wait()
-    for _ in range(10):
-        await asyncio.sleep(0)
-    finished_before_siblings = drain.done()
 
-    release_successes.set()
+    try:
+        await asyncio.wait_for(abort_requested.wait(), timeout=0.01)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        finished_before_siblings = drain.done()
+    finally:
+        release_successes.set()
+
     with pytest.raises(RuntimeError) as error:
         await drain
     for _ in range(10):
@@ -373,7 +426,7 @@ async def test_submission_failure_drains_and_requeues_active_sibling(monkeypatch
 
     data_source.reserve_samples = reserve_samples
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         generation_started.set()
         await release_generation.wait()
         return group
@@ -415,7 +468,7 @@ async def test_submission_failure_requeues_prefetched_terminal_group(monkeypatch
 
     data_source.reserve_samples = reserve_samples
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         if group[0].group_index == 36:
             await release_prefetch.wait()
         return group
@@ -445,11 +498,40 @@ async def test_submission_failure_requeues_prefetched_terminal_group(monkeypatch
     assert data_source.requeued == [[prefetched_reservation], [leased_reservation]]
 
 
-async def test_local_execution_cancellation_does_not_requeue_without_terminal_receipt(monkeypatch):
+async def test_executor_rejection_does_not_charge_sample_backfill(monkeypatch):
+    reservation = make_reservation(55)
+    data_source = FakeReservationDataSource([reservation])
+    submission_error = RuntimeError("submission rejected")
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        rollout_submission_granularity="sample",
+    )
+    assert fn._executor is not None
+
+    def submit(
+        source_reservation: SourceReservation,
+        executor_receipt: ReservationExecutorReceipt,
+    ) -> None:
+        assert source_reservation is reservation
+        raise submission_error
+
+    monkeypatch.setattr(fn._executor, "submit", submit)
+
+    with pytest.raises(RuntimeError) as error:
+        await fn(RolloutFnTrainInput(rollout_id=55))
+
+    assert error.value is submission_error
+    assert fn._scheduler.samples_in_flight == 0
+    assert data_source.requeued == [[reservation]]
+    assert data_source.requeued[0][0] is reservation
+
+
+async def test_terminal_local_execution_cancellation_requeues_exact_source_reservation(monkeypatch):
     reservation = make_reservation(29)
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         raise asyncio.CancelledError()
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -459,7 +541,8 @@ async def test_local_execution_cancellation_does_not_requeue_without_terminal_re
 
     assert data_source.reserved == [reservation]
     assert data_source.acknowledged == []
-    assert data_source.requeued == []
+    assert data_source.requeued == [[reservation]]
+    assert data_source.requeued[0][0] is reservation
 
 
 async def test_aborted_owned_group_requeues_pristine_reservation(monkeypatch):
@@ -467,7 +550,7 @@ async def test_aborted_owned_group_requeues_pristine_reservation(monkeypatch):
     completed_reservation = make_reservation(4)
     data_source = FakeReservationDataSource([aborted_reservation, completed_reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         if group[0].group_index == 3:
             for sample in group:
                 sample.response = "aborted output"
@@ -501,7 +584,7 @@ async def test_owned_group_rejects_missing_parent_slot_without_losing_reservatio
     reservation = make_reservation(5)
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         return group[:1]
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -518,7 +601,7 @@ async def test_owned_group_rejects_reordered_parent_identity_without_losing_rese
     reservation = make_reservation(24)
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         return [deepcopy(group[1]), deepcopy(group[0])]
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -549,7 +632,7 @@ async def test_owned_group_rejects_foreign_one_to_many_child_identity(monkeypatc
     ]
     data_source = FakeReservationDataSource([reservation])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         return generated_group
 
     fn = make_owned_fn(monkeypatch, data_source, generate)
@@ -595,7 +678,7 @@ async def test_owned_execution_capacity_bounds_started_source_samples(monkeypatc
     started: list[int] = []
     data_source = FakeReservationDataSource([make_reservation(index) for index in range(6, 10)])
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         started.append(group[0].group_index)
         await release.wait()
         return group
@@ -628,7 +711,7 @@ async def test_owned_retained_limit_does_not_block_active_completion(monkeypatch
     generation_started = asyncio.Event()
     release_generation = asyncio.Event()
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         generation_started.set()
         await release_generation.wait()
         return group
@@ -783,7 +866,7 @@ async def test_owned_batch_rolls_back_valid_and_identity_invalid_reservations_to
             first_identity_validated.set()
         return error
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         if group[0].group_index == 33:
             return group
         await first_identity_validated.wait()
@@ -818,7 +901,7 @@ async def test_owned_completed_prefetch_overflow_requeues_and_blocks_admission(m
     reservations = [make_reservation(index) for index in range(12, 20)]
     data_source = FakeReservationDataSource(reservations)
 
-    async def generate(state, group, sampling_params, evaluation=False):
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
         started.append(group[0].group_index)
         await release.wait()
         return group
@@ -860,9 +943,9 @@ async def test_owned_completed_prefetch_overflow_requeues_and_blocks_admission(m
     )
 
     output.lease.commit()
-    await wait_until(lambda: len(data_source.reserved) == 4)
+    await wait_until(lambda: len(data_source.reserved) >= 4)
 
-    assert data_source.reserved == reservations[:4]
+    assert data_source.reserved[:4] == reservations[:4]
     assert data_source.acknowledged == [([leased_reservation], 23)]
 
 
@@ -1257,6 +1340,39 @@ async def test_worker_defaults_to_sample_granularity(monkeypatch):
     release.set()
     output = await drain
     assert len(output.samples) == 1
+
+
+async def test_owned_backfill_submits_replacement_before_the_group_returns(monkeypatch):
+    callbacks = []
+    release = asyncio.Event()
+    reservations = [make_reservation(90), make_reservation(91)]
+    data_source = FakeReservationDataSource(reservations)
+
+    async def blocking_generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        callbacks.append(sample_done_callback)
+        await release.wait()
+        return group
+
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        blocking_generate,
+        retained_groups=2,
+        completed_groups=2,
+        rollout_submission_granularity="sample",
+    )
+    drain = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=90)))
+    await wait_until(lambda: len(data_source.reserved) == 1 and len(callbacks) == 1)
+
+    for _ in range(N_SAMPLES_PER_PROMPT):
+        callbacks[0]()
+    await wait_until(lambda: len(data_source.reserved) == 2)
+
+    release.set()
+    output = await drain
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+
+    assert data_source.reserved[:2] == reservations
 
 
 async def test_group_granularity_opts_the_worker_out_of_backfill(monkeypatch):

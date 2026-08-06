@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from copy import deepcopy
 from typing import TypeVar, cast
 
@@ -157,8 +157,14 @@ class _InferenceFullyAsyncExecution(FullyAsyncExecution):
 class InferenceFullyAsyncExecutor(FullyAsyncExecutor):
     """Execute receipt-bound inference groups on the caller's event loop."""
 
-    def __init__(self, state: GenerateState) -> None:
+    def __init__(
+        self,
+        state: GenerateState,
+        *,
+        sample_done_callback: Callable[[], None] | None,
+    ) -> None:
         self._state = state
+        self._sample_done_callback = sample_done_callback
         self._cancellation = _InferenceCancellationCoordinator(state)
         self._tasks: set[asyncio.Task[list[Sample | list[Sample]]]] = set()
         self._closed = False
@@ -187,6 +193,7 @@ class InferenceFullyAsyncExecutor(FullyAsyncExecutor):
             _execute_group(
                 self._state,
                 deepcopy(list(reservation.samples)),
+                sample_done_callback=self._sample_done_callback,
             )
         )
         self._tasks.add(task)
@@ -225,7 +232,19 @@ class InferenceFullyAsyncExecutor(FullyAsyncExecutor):
 async def _execute_group(
     state: GenerateState,
     samples: list[Sample],
+    *,
+    sample_done_callback: Callable[[], None] | None,
 ) -> list[Sample | list[Sample]]:
+    if sample_done_callback is None:
+        return cast(
+            list[Sample | list[Sample]],
+            await generate_and_rm_group(
+                state,
+                samples,
+                sampling_params=state.sampling_params.copy(),
+                evaluation=False,
+            ),
+        )
     return cast(
         list[Sample | list[Sample]],
         await generate_and_rm_group(
@@ -233,6 +252,7 @@ async def _execute_group(
             samples,
             sampling_params=state.sampling_params.copy(),
             evaluation=False,
+            sample_done_callback=sample_done_callback,
         ),
     )
 
