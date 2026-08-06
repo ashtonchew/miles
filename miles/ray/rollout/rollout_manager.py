@@ -538,10 +538,25 @@ class RolloutManager:
 
     # -------------------------- checkpointing -----------------------------
 
-    def save(self, rollout_id):
-        if self.args.rollout_global_dataset:
-            self.data_source.save(rollout_id)
-        event_logger_checkpoint.snapshot(self.args, rollout_id)
+    async def save(self, rollout_id: int) -> None:
+        hold_id = await self.acquire_train_admission_hold()
+        try:
+            if self._train_rollout_lifecycle is not None:
+                prepare_task = self._submit_lifecycle_coroutine(
+                    self._train_rollout_lifecycle.prepare_checkpoint(rollout_id)
+                )
+                await _await_task_before_cancellation(prepare_task)
+            if self.args.rollout_global_dataset:
+                self.data_source.save(rollout_id)
+            event_logger_checkpoint.snapshot(self.args, rollout_id)
+        except BaseException as save_error:
+            try:
+                await self.release_train_admission_hold(hold_id)
+            except BaseException as release_error:
+                raise save_error from release_error
+            raise
+        else:
+            await self.release_train_admission_hold(hold_id)
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
