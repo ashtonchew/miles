@@ -63,7 +63,13 @@ class RecordingTrainAdmissionHold(TrainAdmissionHold):
         self._lifecycle.events.append(f"wait:{self._hold_index}")
 
     def _record_weight_update(self) -> None:
-        pass
+        self._lifecycle.record_started.set()
+        if not self._lifecycle.allow_record.wait(timeout=5):
+            raise TimeoutError("Timed out waiting to record the train weight update.")
+        self._lifecycle.loops.append(asyncio.get_running_loop())
+        self._lifecycle.events.append(f"record:{self._hold_index}")
+        if self._lifecycle.record_failure is not None:
+            raise self._lifecycle.record_failure
 
     def _release(self) -> None:
         self._lifecycle.release_started.set()
@@ -87,6 +93,10 @@ class RecordingRolloutLifecycle(RolloutFnLifecycle):
         self.wait_started = threading.Event()
         self.allow_wait = threading.Event()
         self.allow_wait.set()
+        self.record_started = threading.Event()
+        self.allow_record = threading.Event()
+        self.allow_record.set()
+        self.record_failure: BaseException | None = None
         self.release_started = threading.Event()
         self.allow_release = threading.Event()
         self.allow_release.set()
@@ -505,6 +515,7 @@ class TestRolloutLifecycle:
         assert manager._rollout_lifecycles == ()
         assert await manager.acquire_train_admission_hold() is None
         await manager.wait_train_admission_hold(None)
+        await manager.record_train_weight_update(None)
         await manager.release_train_admission_hold(None)
         await manager.dispose()
 
@@ -840,10 +851,12 @@ class TestRolloutLifecycle:
         first_hold_id = await manager.acquire_train_admission_hold()
         second_hold_id = await manager.acquire_train_admission_hold()
         await manager.wait_train_admission_hold(first_hold_id)
+        await manager.record_train_weight_update(first_hold_id)
         await manager.release_train_admission_hold(first_hold_id)
         with pytest.raises(RuntimeError) as duplicate_release:
             await manager.release_train_admission_hold(first_hold_id)
         await manager.wait_train_admission_hold(second_hold_id)
+        await manager.record_train_weight_update(second_hold_id)
         await manager.release_train_admission_hold(second_hold_id)
 
         assert (first_hold_id, second_hold_id) == (0, 1)
@@ -852,8 +865,10 @@ class TestRolloutLifecycle:
             "acquire:0",
             "acquire:1",
             "wait:0",
+            "record:0",
             "release:0",
             "wait:1",
+            "record:1",
             "release:1",
         ]
         assert len({id(loop) for loop in lifecycle.loops}) == 1
@@ -912,6 +927,52 @@ class TestRolloutLifecycle:
         assert events == ["acquire:0", "wait:0", "release:0"]
         assert lifecycle.active_holds == set()
 
+    async def test_cancelled_weight_update_record_settles_and_leaves_handle_releasable(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        lifecycle.allow_record.clear()
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        hold_id = await manager.acquire_train_admission_hold()
+        await manager.wait_train_admission_hold(hold_id)
+        record_task = asyncio.create_task(manager.record_train_weight_update(hold_id))
+        assert await asyncio.to_thread(lifecycle.record_started.wait, 5)
+
+        record_task.cancel()
+        await asyncio.sleep(0)
+        assert record_task.done() is False
+        lifecycle.allow_record.set()
+        with pytest.raises(asyncio.CancelledError):
+            await record_task
+        await manager.release_train_admission_hold(hold_id)
+
+        assert events == ["acquire:0", "wait:0", "record:0", "release:0"]
+        assert lifecycle.active_holds == set()
+
+    async def test_weight_update_record_failure_retains_its_handle_and_fence(self, lifecycle_manager):
+        manager = lifecycle_manager
+        events: list[str] = []
+        failure = RuntimeError("weight update record failed")
+        lifecycle = RecordingRolloutLifecycle(events)
+        lifecycle.record_failure = failure
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        hold_id = await manager.acquire_train_admission_hold()
+        await manager.wait_train_admission_hold(hold_id)
+
+        with pytest.raises(RuntimeError) as record_error:
+            await manager.record_train_weight_update(hold_id)
+
+        assert record_error.value is failure
+        assert manager._weight_update_fence_hold_id == hold_id
+        assert list(manager._train_admission_holds) == [hold_id]
+
+        lifecycle.record_failure = None
+        await manager.record_train_weight_update(hold_id)
+        await manager.release_train_admission_hold(hold_id)
+
+        assert events == ["acquire:0", "wait:0", "record:0", "record:0", "release:0"]
+        assert lifecycle.active_holds == set()
+
     async def test_cancelled_hold_release_settles_and_consumes_handle(self, lifecycle_manager):
         manager = lifecycle_manager
         events: list[str] = []
@@ -951,6 +1012,235 @@ class TestRolloutLifecycle:
         await manager.eval(rollout_id=19)
 
         assert events == ["acquire:0", "eval:19", "release:0"]
+
+    @pytest.mark.parametrize("first_operation", ["eval", "update"])
+    async def test_shared_eval_and_weight_update_are_mutually_exclusive(
+        self,
+        lifecycle_manager,
+        first_operation: str,
+    ):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        _install_train_rollout_lifecycle(manager, RecordingRolloutLifecycle([]))
+        eval_started = threading.Event()
+        finish_eval = threading.Event()
+        update_started = asyncio.Event()
+        finish_update = asyncio.Event()
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval:start")
+            eval_started.set()
+            assert finish_eval.wait(timeout=5)
+            events.append("eval:end")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        async def update_weights() -> None:
+            hold_id = await manager.acquire_train_admission_hold()
+            assert hold_id is not None
+            await manager.wait_train_admission_hold(hold_id)
+            events.append("update:start")
+            update_started.set()
+            await finish_update.wait()
+            events.append("update:end")
+            await manager.release_train_admission_hold(hold_id)
+
+        manager.eval_generate_rollout = evaluate
+        eval_task = None
+        update_task = None
+        try:
+            if first_operation == "eval":
+                events.append("eval:requested")
+                eval_task = asyncio.create_task(manager.eval(rollout_id=26))
+                assert await asyncio.to_thread(eval_started.wait, 5)
+                events.append("update:requested")
+                update_task = asyncio.create_task(update_weights())
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(update_started.wait(), timeout=0.1)
+                finish_eval.set()
+                await eval_task
+                await asyncio.wait_for(update_started.wait(), timeout=5)
+                finish_update.set()
+                await update_task
+            else:
+                events.append("update:requested")
+                update_task = asyncio.create_task(update_weights())
+                await asyncio.wait_for(update_started.wait(), timeout=5)
+                events.append("eval:requested")
+                eval_task = asyncio.create_task(manager.eval(rollout_id=26))
+                assert await asyncio.to_thread(eval_started.wait, 0.1) is False
+                finish_update.set()
+                await update_task
+                assert await asyncio.to_thread(eval_started.wait, 5)
+                finish_eval.set()
+                await eval_task
+        finally:
+            finish_eval.set()
+            finish_update.set()
+            tasks = [task for task in (eval_task, update_task) if task is not None]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if first_operation == "eval":
+            assert events == [
+                "eval:requested",
+                "eval:start",
+                "update:requested",
+                "eval:end",
+                "update:start",
+                "update:end",
+            ]
+        else:
+            assert events == [
+                "update:requested",
+                "update:start",
+                "eval:requested",
+                "update:end",
+                "eval:start",
+                "eval:end",
+            ]
+
+    async def test_failed_weight_update_keeps_shared_eval_excluded(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        _install_train_rollout_lifecycle(manager, RecordingRolloutLifecycle([]))
+        update_failure = RuntimeError("weight update failed")
+        hold_id: int | None = None
+        eval_started = threading.Event()
+        finish_eval = threading.Event()
+
+        async def update_weights() -> None:
+            nonlocal hold_id
+            hold_id = await manager.acquire_train_admission_hold()
+            assert hold_id is not None
+            await manager.wait_train_admission_hold(hold_id)
+            events.append("update:start")
+            raise update_failure
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval:start")
+            eval_started.set()
+            assert finish_eval.wait(timeout=5)
+            events.append("eval:end")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+        with pytest.raises(RuntimeError) as error:
+            await update_weights()
+        assert error.value is update_failure
+
+        events.append("eval:requested")
+        eval_task = asyncio.create_task(manager.eval(rollout_id=27))
+        try:
+            assert await asyncio.to_thread(eval_started.wait, 0.1) is False
+            assert hold_id is not None
+            await manager.release_train_admission_hold(hold_id)
+            hold_id = None
+            assert await asyncio.to_thread(eval_started.wait, 5)
+            finish_eval.set()
+            await eval_task
+        finally:
+            if hold_id is not None:
+                await manager.release_train_admission_hold(hold_id)
+            finish_eval.set()
+            await asyncio.gather(eval_task, return_exceptions=True)
+
+        assert events == [
+            "update:start",
+            "eval:requested",
+            "eval:start",
+            "eval:end",
+        ]
+
+    async def test_weight_update_release_failure_poison_fails_future_engine_users(
+        self,
+        lifecycle_manager,
+    ):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        release_failure = RuntimeError("hold release failed")
+        evaluated = False
+
+        class FailingReleaseHold(TrainAdmissionHold):
+            async def _wait_terminal(self) -> None:
+                return
+
+            def _record_weight_update(self) -> None:
+                return
+
+            def _release(self) -> None:
+                raise release_failure
+
+        class FailingOnceReleaseLifecycle(RecordingRolloutLifecycle):
+            def __init__(self) -> None:
+                super().__init__([])
+                self._fail_next_release = True
+
+            async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+                if self._fail_next_release:
+                    self._fail_next_release = False
+                    return FailingReleaseHold()
+                return await super().acquire_train_admission_hold()
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            nonlocal evaluated
+            evaluated = True
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        _install_train_rollout_lifecycle(manager, FailingOnceReleaseLifecycle())
+        manager.eval_generate_rollout = evaluate
+        failed_hold_id = await manager.acquire_train_admission_hold()
+        assert failed_hold_id is not None
+        await manager.wait_train_admission_hold(failed_hold_id)
+        await manager.record_train_weight_update(failed_hold_id)
+
+        with pytest.raises(RuntimeError) as release_error:
+            await manager.release_train_admission_hold(failed_hold_id)
+        assert release_error.value is release_failure
+
+        queued_hold_id = await manager.acquire_train_admission_hold()
+        assert queued_hold_id is not None
+        with pytest.raises(RuntimeError) as wait_error:
+            await asyncio.wait_for(manager.wait_train_admission_hold(queued_hold_id), timeout=1)
+        assert str(wait_error.value) == "Weight-update fence failed during train admission hold release."
+        assert wait_error.value.__cause__ is release_failure
+        await manager.release_train_admission_hold(queued_hold_id)
+
+        with pytest.raises(RuntimeError) as eval_error:
+            await asyncio.wait_for(manager.eval(rollout_id=29), timeout=1)
+        assert str(eval_error.value) == "Weight-update fence failed during train admission hold release."
+        assert eval_error.value.__cause__ is release_failure
+        assert evaluated is False
+
+    async def test_cancelled_queued_weight_update_wait_does_not_claim_exclusion(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        _install_train_rollout_lifecycle(manager, RecordingRolloutLifecycle([]))
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+        active_hold_id = await manager.acquire_train_admission_hold()
+        assert active_hold_id is not None
+        await manager.wait_train_admission_hold(active_hold_id)
+        queued_hold_id = await manager.acquire_train_admission_hold()
+        assert queued_hold_id is not None
+        queued_wait_task = asyncio.create_task(manager.wait_train_admission_hold(queued_hold_id))
+        await asyncio.sleep(0)
+        assert queued_wait_task.done() is False
+
+        queued_wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued_wait_task
+        await manager.release_train_admission_hold(queued_hold_id)
+        await manager.release_train_admission_hold(active_hold_id)
+
+        await asyncio.wait_for(manager.eval(rollout_id=28), timeout=5)
+
+        assert events == ["eval"]
 
     async def test_cancelled_legacy_shared_eval_returns_before_worker_finishes(self, lifecycle_manager):
         manager = lifecycle_manager
@@ -1093,47 +1383,49 @@ class TestRolloutLifecycle:
             "release:1",
         ]
 
-    async def test_cancelled_shared_eval_keeps_hold_until_invocation_settles(self, lifecycle_manager):
+    async def test_cancelled_shared_eval_blocks_weight_update_until_invocation_settles(self, lifecycle_manager):
         manager = lifecycle_manager
         manager.args.debug_train_only = False
         events: list[str] = []
-        lifecycle = RecordingRolloutLifecycle(events)
-        _install_train_rollout_lifecycle(manager, lifecycle)
+        _install_train_rollout_lifecycle(manager, RecordingRolloutLifecycle([]))
         eval_started = threading.Event()
         finish_eval = threading.Event()
+        update_started = asyncio.Event()
 
         def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
-            events.append("eval_started")
+            events.append("eval:start")
             eval_started.set()
             assert finish_eval.wait(timeout=5)
-            events.append("eval_finished")
+            events.append("eval:end")
             return RolloutFnEvalOutput(data={}, metrics=None)
+
+        async def update_weights() -> None:
+            hold_id = await manager.acquire_train_admission_hold()
+            assert hold_id is not None
+            await manager.wait_train_admission_hold(hold_id)
+            events.append("update:start")
+            update_started.set()
+            await manager.release_train_admission_hold(hold_id)
 
         manager.eval_generate_rollout = evaluate
         eval_task = asyncio.create_task(manager.eval(rollout_id=22))
         assert await asyncio.to_thread(eval_started.wait, 5)
 
         eval_task.cancel()
-
-        async def wait_for_release() -> None:
-            while lifecycle.active_holds:
-                await asyncio.sleep(0)
-
+        update_task = asyncio.create_task(update_weights())
         try:
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(wait_for_release(), timeout=0.1)
+                await asyncio.wait_for(update_started.wait(), timeout=0.1)
             assert eval_task.done() is False
-            assert lifecycle.active_holds == {0}
-            assert events == ["acquire:0", "eval_started"]
+            assert events == ["eval:start"]
         finally:
             finish_eval.set()
-            await asyncio.gather(eval_task, return_exceptions=True)
+            await asyncio.gather(eval_task, update_task, return_exceptions=True)
 
         with pytest.raises(asyncio.CancelledError):
             await eval_task
 
-        assert lifecycle.active_holds == set()
-        assert events == ["acquire:0", "eval_started", "eval_finished", "release:0"]
+        assert events == ["eval:start", "eval:end", "update:start"]
 
     async def test_dispose_closes_unique_rollout_lifecycles_before_manager_resources(
         self,
