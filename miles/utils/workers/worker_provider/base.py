@@ -5,6 +5,7 @@ from typing import Any
 
 from miles.utils.workers.naming import compute_cell_id, parse_worker_name
 from miles.utils.workers.worker_handle import BaseWorkerHandle
+from miles.utils.workers.worker_info import WorkerInfo
 from miles.utils.workers.worker_spec import HostAndPort, NamedHostAndPorts
 
 
@@ -33,9 +34,13 @@ class BaseWorkerProvider(abc.ABC):
     @abc.abstractmethod
     async def watch_cells(self, reconcile: ReconcileFn, *, spec_names: list[str]) -> StopWatchFn: ...
 
+    @abc.abstractmethod
+    def get_worker_infos_of(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]: ...
+
     def get_handle(self, worker_name: str) -> BaseWorkerHandle:
         spec_name, cell_index, _worker_in_cell_index = parse_worker_name(worker_name)
         cell_id = compute_cell_id(spec_name=spec_name, cell_index=cell_index)
-        matches = [info for info in self.get_worker_infos(cell_id=cell_id) if info.name == worker_name]
+        (infos,) = self.get_worker_infos_of(cell_ids=[cell_id])
+        matches = [info for info in infos if info.name == worker_name]
         assert len(matches) == 1, f"{worker_name=} matched {[info.name for info in matches]}"
         return matches[0].handle

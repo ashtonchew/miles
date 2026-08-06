@@ -25,7 +25,6 @@ from miles.utils.ft_utils.api_server.models import CellStatus
 from miles.utils.ft_utils.health_checker import ActivenessTracker
 from miles.utils.misc import NodeProbeMixin, SimpleTicker
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
-from miles.utils.workers.worker_provider.ray import RayWorkerProvider
 from miles.utils.workers.worker_provider.utils import apply_cell_observation
 
 logger = logging.getLogger(__name__)
@@ -39,8 +38,16 @@ CELLS_READY_TIMEOUT_SECONDS = 3600.0
 @enforce_lock_discipline
 class InferenceController(NodeProbeMixin):
     @lock_exempt
-    def __init__(self, args) -> None:
+    def __init__(
+        self,
+        args,
+        *,
+        engine_provider: BaseWorkerProvider | None,
+        router_provider: BaseWorkerProvider | None,
+    ) -> None:
         self.args = args
+        self._engine_provider = engine_provider
+        self._router_provider = router_provider
         self.context_lock = ContextLock("InferenceController")
         self.servers: dict[str, RolloutServer] = {}
         self._watcher_disposers: list[StopWatchFn] = []
@@ -52,18 +59,24 @@ class InferenceController(NodeProbeMixin):
         if self.args.debug_train_only:
             return
 
-        router_addrs = await resolve_router_addrs(self.args)
+        engine_provider = self._engine_provider
+        assert engine_provider is not None and self._router_provider is not None, (
+            "a controller that serves engines must be given both providers; "
+            "only --debug-train-only builds one without them"
+        )
+
+        router_addrs = await resolve_router_addrs(self.args, provider=self._router_provider)
         self.servers = await create_rollout_servers(
             self.args,
             context_lock=self.context_lock,
             global_health_checker_activeness=self._health_checker_activeness.get,
+            engine_provider=engine_provider,
             router_addrs=router_addrs,
         )
 
-        # TODO: may change to injecting the provider later
-        provider: BaseWorkerProvider = RayWorkerProvider.create()  # TODO inject instance
+        engine_spec_names = compute_engine_spec_names(self.args)
         self._watcher_disposers.append(
-            await provider.watch_cells(self._reconcile, spec_names=compute_engine_spec_names(self.args))
+            await engine_provider.watch_cells(self._reconcile, spec_names=engine_spec_names)
         )
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
@@ -76,7 +89,8 @@ class InferenceController(NodeProbeMixin):
     @with_lock
     async def prepare_rollout(self, rollout_id: int) -> None:
         await self._health_monitoring_resume()
-        await dashboard_hooks.register_engines(self.servers)
+        if (engine_provider := self._engine_provider) is not None:
+            await dashboard_hooks.register_engines(self.servers, provider=engine_provider)
 
     @with_lock
     async def prepare_eval(self) -> None:

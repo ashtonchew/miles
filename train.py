@@ -5,7 +5,7 @@ import os
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.ray.placement_group import create_rollout_components, create_training_models
-from miles.ray.wiring import launch_worker_manager
+from miles.ray.wiring import create_backend_capability
 from miles.utils import object_store
 from miles.utils.arguments import parse_args
 from miles.utils.audit_utils.process_identity import MainProcessIdentity
@@ -24,16 +24,18 @@ async def train(args):
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
-    _worker_manager = launch_worker_manager(args)
+    capability = create_backend_capability(args)
     object_store.init_instance(args, contribute_segment=False)
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
+    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(
+        args, capability=capability
+    )
 
     # create the actor and critic models
-    actor_model, critic_model = await create_training_models(args, rollout_executor)
+    actor_model, critic_model = await create_training_models(args, rollout_executor, capability=capability)
 
     if args.api_server_port:
         start_api_server(
@@ -42,6 +44,7 @@ async def train(args):
             inference_controller=inference_controller,
             port=args.api_server_port,
             ft_components=args.ft_components,
+            cell_operations=capability.cell_operations(),
         )
 
     maybe_start_mini_ft_controller(args)
@@ -63,7 +66,7 @@ async def train(args):
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
         await inference_controller.prepare_eval()
-        await rollout_executor.eval(rollout_id=0)
+        await rollout_executor.eval(0)
 
     async def offload_train():
         if args.use_critic:

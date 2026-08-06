@@ -7,11 +7,15 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
-from miles.ray.specs.inference import create_inference_controller_handle
+from miles.ray.specs.inference import (
+    compute_router_worker_name,
+    create_inference_controller_handle,
+    session_server_worker_name,
+)
 from miles.ray.specs.rollout import create_rollout_executor_handle
 from miles.ray.specs.train import create_trainer_controller_handle
+from miles.utils.workers.backend_capability.base import BackendCapability
 from miles.utils.workers.worker_handle import BaseWorkerHandle
-
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +129,17 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
     return ans
 
 
-async def create_training_models(args, rollout_executor) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
-    actor_model = create_trainer_controller_handle(role="actor")
+async def create_training_models(
+    args,
+    rollout_executor: BaseWorkerHandle,
+    *,
+    capability: BackendCapability,
+) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+    actor_model = create_trainer_controller_handle(capability=capability, role="actor")
     actor_start_rollout_ids = await actor_model.init()
 
     if args.use_critic:
-        critic_model = create_trainer_controller_handle(role="critic")
+        critic_model = create_trainer_controller_handle(capability=capability, role="critic")
         critic_start_rollout_ids = await critic_model.init()
     else:
         critic_model = None
@@ -153,15 +162,21 @@ class RolloutComponents(NamedTuple):
     num_rollout_per_epoch: int | None
 
 
-async def create_rollout_components(args) -> RolloutComponents:
+async def create_rollout_components(args, *, capability: BackendCapability) -> RolloutComponents:
     if not args.debug_train_only:
-        await resolve_router_addrs(args)
-        await wait_session_server_ready(args)
+        router_worker_name = compute_router_worker_name(0)
+        await resolve_router_addrs(args, provider=capability.static_worker_provider(worker_name=router_worker_name))
+        session_server_provider = (
+            capability.static_worker_provider(worker_name=session_server_worker_name(0))
+            if args.use_session_server
+            else None
+        )
+        await wait_session_server_ready(args, provider=session_server_provider)
 
-    inference_controller = create_inference_controller_handle()
+    inference_controller = create_inference_controller_handle(capability=capability)
     await inference_controller.init()
 
-    rollout_executor = create_rollout_executor_handle()
+    rollout_executor = create_rollout_executor_handle(capability=capability)
     await rollout_executor.init()
 
     # calculate num_rollout from num_epoch

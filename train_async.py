@@ -3,7 +3,7 @@ import logging
 import os
 
 from miles.ray.placement_group import create_rollout_components, create_training_models
-from miles.ray.wiring import launch_worker_manager
+from miles.ray.wiring import create_backend_capability
 from miles.utils import object_store
 from miles.utils.arguments import parse_args, validate_async_off_policy_correction
 from miles.utils.async_utils import eager_create_task
@@ -25,16 +25,18 @@ async def train(args):
     validate_async_off_policy_correction(args)
     configure_logger(args, source=MainProcessIdentity())
     maybe_start_periodic_pyspy_dump()
-    _worker_manager = launch_worker_manager(args)
+    capability = create_backend_capability(args)
     object_store.init_instance(args, contribute_segment=False)
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
+    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(
+        args, capability=capability
+    )
 
     # create the actor and critic models
-    actor_model, critic_model = await create_training_models(args, rollout_executor)
+    actor_model, critic_model = await create_training_models(args, rollout_executor, capability=capability)
 
     if args.api_server_port:
         start_api_server(
@@ -43,6 +45,7 @@ async def train(args):
             inference_controller=inference_controller,
             port=args.api_server_port,
             ft_components=args.ft_components,
+            cell_operations=capability.cell_operations(),
         )
 
     maybe_start_mini_ft_controller(args)

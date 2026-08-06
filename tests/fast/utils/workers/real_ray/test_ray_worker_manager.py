@@ -117,7 +117,8 @@ class TestNamedManagerActor:
         manager_factory([make_command_spec("router", launch_command=probe.launch_command)])
         records = probe.wait_for_records(1)
 
-        addr = await RayWorkerProvider.create().get_addr(worker_name="router-0-0")
+        provider = RayWorkerProvider(worker_manager_handle=RayWorkerManager.get_handle())
+        addr = await provider.get_addr(worker_name="router-0-0")
 
         assert isinstance(addr, HostAndPort)
         assert records["0-0"]["context"]["self_addrs"]["primary"] == {"host": addr.host, "port": addr.port}

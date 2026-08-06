@@ -12,6 +12,11 @@ from miles.utils.workers.rpc.client.handle import RpcWorkerHandle
 from miles.utils.workers.worker_handle import BaseWorkerHandle, WorkerUnreachableError
 
 
+class _ProbeableWorker:
+    def demo(self) -> int:
+        return 1
+
+
 class TestBaseWorkerHandle:
     def test_rpc_handle_implements_the_contract(self):
         """The rpc client is a worker handle, so callers can hold the base type."""
@@ -193,8 +198,8 @@ class TestRayWorkerHandleWaitDead:
         async def _noop_sleep(seconds):
             slept.append(seconds)
 
-        monkeypatch.setattr(worker_handle_module.asyncio, "sleep", _noop_sleep)
-        monkeypatch.setattr(worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 1.0])))
+        monkeypatch.setattr(ray_worker_handle_module.asyncio, "sleep", _noop_sleep)
+        monkeypatch.setattr(ray_worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 1.0])))
         handle, inner = _make_handle(
             __ray_ready__=_FakeRemoteMethod(
                 [
@@ -216,13 +221,13 @@ class TestRayWorkerHandleWaitDead:
         async def _noop_sleep(seconds: float) -> None:
             slept.append(seconds)
 
-        monkeypatch.setattr(worker_handle_module.asyncio, "sleep", _noop_sleep)
+        monkeypatch.setattr(ray_worker_handle_module.asyncio, "sleep", _noop_sleep)
         monkeypatch.setattr(
-            worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 60.0, 200.0]))
+            ray_worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 60.0, 200.0]))
         )
         handle, inner = _make_handle(__ray_ready__=_FakeRemoteMethod([_return_factory(None)]))
 
-        with caplog.at_level(logging.ERROR, logger="miles.utils.workers.worker_handle"):
+        with caplog.at_level(logging.ERROR, logger="miles.utils.workers.ray_worker_handle"):
             await handle.wait_dead(timeout=120.0)
 
         assert inner.__ray_ready__.call_count == 2
@@ -237,14 +242,23 @@ class TestRayWorkerHandleWaitDead:
         async def _noop_sleep(seconds):
             return None
 
-        monkeypatch.setattr(worker_handle_module.asyncio, "sleep", _noop_sleep)
-        monkeypatch.setattr(worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 200.0])))
+        monkeypatch.setattr(ray_worker_handle_module.asyncio, "sleep", _noop_sleep)
+        monkeypatch.setattr(ray_worker_handle_module, "time", SimpleNamespace(monotonic=_make_monotonic([0.0, 200.0])))
         handle, inner = _make_handle(__ray_ready__=_FakeRemoteMethod([_raise_factory(asyncio.TimeoutError())]))
 
-        with caplog.at_level(logging.ERROR, logger="miles.utils.workers.worker_handle"):
+        with caplog.at_level(logging.ERROR, logger="miles.utils.workers.ray_worker_handle"):
             await handle.wait_dead(timeout=120.0)
 
         assert inner.__ray_ready__.call_count == 1
         error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(error_records) == 1
         assert "Timed out after 120s waiting for" in error_records[0].getMessage()
+
+
+class TestRpcWorkerHandleWaitDead:
+    @pytest.mark.asyncio
+    async def test_a_server_that_cannot_be_reached_is_confirmed_dead(self):
+        """A cell heals once its ranks are gone, and nothing answering at their address is that proof."""
+        handle = RpcWorkerHandle(_ProbeableWorker, server_url="http://127.0.0.1:1")
+
+        await handle.wait_dead(timeout=1.0)
