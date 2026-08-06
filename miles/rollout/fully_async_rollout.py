@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 
 import httpx
 
@@ -32,6 +33,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainOutput,
 )
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from miles.rollout.fully_async.ownership import ReservationTerminalReceipt
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.submission_scheduler import make_submission_scheduler
@@ -49,8 +51,15 @@ WEIGHT_VERSION_QUERY_TIMEOUT_SECS = 2.0
 # returns multiple samples per trajectory (e.g. multi-agent).
 Group = list[Sample | list[Sample]]
 
-# prompt + sample group for this prompt. used for group resubmission
-BufferEntry = tuple[list[Sample], Group]
+
+@dataclass(frozen=True)
+class _OwnedCompletedGroup:
+    terminal_receipt: ReservationTerminalReceipt
+    samples: Group
+
+
+BufferSource = list[Sample] | _OwnedCompletedGroup
+BufferEntry = tuple[BufferSource, Group]
 
 
 def _iter_samples(group: Group) -> Iterator[Sample]:
@@ -78,11 +87,11 @@ class DataBuffer:
 
     (1) max groups: use ``--async-data-buffer-max-batches`` to set the max size
         of the buffer, in multiples of rollout_batch_size. On overflow the most
-        stale groups are evicted and their prompts recycled for regeneration;
+        stale groups are evicted and their sources settled for regeneration;
         0 disables eviction and blocks the producer when the buffer is full.
     (2) order: use ``--async-data-buffer-order`` to set the consumption order,
-        fifo (default) or lifo. lifo trains on the freshest group first — pair
-        it with (1) and/or ``--max-weight-staleness`` so sunk old groups are
+        fifo (default) or lifo. lifo trains on the freshest group first; pair
+        it with (1) and/or ``--max-weight-staleness`` so old groups are
         evicted rather than eventually trained on.
     """
 
@@ -92,7 +101,7 @@ class DataBuffer:
         order: str,
         max_groups: int | None,
         max_staleness: int | None,
-        on_evict: Callable[[list[Sample]], None],
+        on_evict: Callable[[BufferSource], None],
     ):
         assert order in ("fifo", "lifo"), f"unknown buffer order: {order}"
         assert max_groups is None or max_groups > 0, f"non-positive buffer capacity: {max_groups}"
@@ -176,6 +185,24 @@ class DataBuffer:
         self.evicted_stale_groups = 0
         self.evicted_overflow_groups = 0
 
+    async def discard_all(self, on_discard: Callable[[BufferSource], None]) -> Exception | None:
+        """Discard buffered entries after their ownership settlement succeeds."""
+        first_error: Exception | None = None
+        async with self._cond:
+            index = 0
+            while index < len(self._entries):
+                source, _ = self._entries[index]
+                try:
+                    on_discard(source)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                    index += 1
+                else:
+                    self._entries.pop(index)
+            self._cond.notify_all()
+        return first_error
+
 
 class _CachedWeightVersion:
     """Throttled query of the current engine weight version via the router's /model_info."""
@@ -236,7 +263,7 @@ class FullyAsyncRolloutFn:
                 order=self.args.async_data_buffer_order,
                 max_groups=max_batches * self.args.rollout_batch_size if max_batches else None,
                 max_staleness=self.args.max_weight_staleness,
-                on_evict=self._recycle,
+                on_evict=self._recycle_buffer_source,
             )
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
@@ -410,6 +437,11 @@ class FullyAsyncRolloutFn:
             metrics["rollout/fully_async/buffer_max_staleness"] = worst
 
         return RolloutFnTrainOutput(samples=data, metrics=metrics)
+
+    def _recycle_buffer_source(self, source: BufferSource) -> None:
+        if isinstance(source, _OwnedCompletedGroup):
+            raise RuntimeError("Owned buffer settlement requires owned scheduling.")
+        self._recycle(source)
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         for sample in prompt_group:

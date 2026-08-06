@@ -427,6 +427,25 @@ async def test_buffer_evicts_stalest_on_overflow():
     assert group[0].group_index == 2
 
 
+async def test_buffer_eviction_recycles_the_original_prompt_group(monkeypatch):
+    data_source = FakeDataSource()
+    fn = make_fn(monkeypatch, make_args(), data_source)
+    buffer = fully_async.DataBuffer(
+        order="fifo",
+        max_groups=1,
+        max_staleness=None,
+        on_evict=fn._recycle_buffer_source,
+    )
+    prompt_group = make_group(1)
+    generated_group = make_group(101, weight_versions=["5"])
+
+    await buffer.put((prompt_group, generated_group))
+    await buffer.put((make_group(2), make_group(102, weight_versions=["9"])))
+
+    assert data_source.recycled[0] is prompt_group
+    assert generated_group not in data_source.recycled
+
+
 async def test_buffer_overflow_tie_broken_by_summed_staleness():
     buffer, evicted = make_buffer(max_groups=2)
     # Same stalest sample (version 5); the first group's other sample is also
@@ -456,6 +475,18 @@ async def test_buffer_threshold_evicts_all_over_staleness_first():
     assert buffer.qsize() == 2
 
 
+async def test_buffer_threshold_evicts_existing_groups_stalest_first():
+    buffer, evicted = make_buffer(max_groups=3, max_staleness=2)
+    less_stale = make_group(1, weight_versions=["6"])
+    most_stale = make_group(2, weight_versions=["5"])
+    await put_group(buffer, less_stale, current_version=10)
+    await put_group(buffer, most_stale, current_version=10)
+    await put_group(buffer, make_group(3, weight_versions=["9"]), current_version=10)
+    await put_group(buffer, make_group(4, weight_versions=["10"]), current_version=10)
+
+    assert evicted == [most_stale, less_stale]
+
+
 async def test_buffer_lifo_serves_freshest_first():
     buffer, _ = make_buffer(order="lifo")
     await put_group(buffer, make_group(1))
@@ -480,7 +511,7 @@ async def test_drain_reports_eviction_metrics(monkeypatch):
 
     # Evictions land in the buffer counters between drains; the racy overflow
     # path itself is covered by the DataBuffer tests above.
-    assert fn._output._on_evict == fn._recycle
+    assert fn._output._on_evict == fn._recycle_buffer_source
     fn._output.entered_groups += 8
     fn._output.evicted_stale_groups = 1
     fn._output.evicted_overflow_groups = 2
