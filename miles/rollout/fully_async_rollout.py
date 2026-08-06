@@ -19,10 +19,11 @@ rollout engines, pausing producer submissions for the duration of the
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import cast
+from typing import TypeVar, cast
 
 import httpx
 
@@ -37,6 +38,7 @@ from miles.rollout.base_types import (
     TrainBatchLease,
     TrainBatchRollbackReason,
 )
+from miles.rollout.data_source import SourceReservation
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.fully_async.execution import (
     FullyAsyncExecution,
@@ -44,6 +46,7 @@ from miles.rollout.fully_async.execution import (
     FullyAsyncExecutionRetry,
     FullyAsyncExecutionSuccess,
     FullyAsyncRetryReason,
+    FullyAsyncTerminalPendingError,
 )
 from miles.rollout.fully_async.ownership import ReservationOwnership, ReservationStageId, ReservationTerminalReceipt
 from miles.rollout.inference_rollout.fully_async import InferenceFullyAsyncExecutor
@@ -55,6 +58,8 @@ from miles.utils.misc import load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 OUTPUT_QUEUE_MAX_GROUPS = 1000
 NO_PROGRESS_WARN_SECS = 30.0
@@ -223,7 +228,7 @@ class DataBuffer:
         max_groups: int | None,
         max_staleness: int | None,
         on_evict: Callable[[BufferSource], None],
-    ):
+    ) -> None:
         assert order in ("fifo", "lifo"), f"unknown buffer order: {order}"
         assert max_groups is None or max_groups > 0, f"non-positive buffer capacity: {max_groups}"
         self._order = order
@@ -242,15 +247,22 @@ class DataBuffer:
 
     async def put(self, entry: BufferEntry, *, current_version: int | None = None) -> None:
         async with self._cond:
-            if self._evict_on_overflow:
-                self._entries.append(entry)
-                if len(self._entries) > self._capacity:
-                    self._evict_overflow(current_version)
-            else:
+            if not self._evict_on_overflow:
                 while len(self._entries) >= self._capacity:
                     await self._cond.wait()
-                self._entries.append(entry)
+            self._entries.append(entry)
             self.entered_groups += 1
+            try:
+                if self._evict_on_overflow and len(self._entries) > self._capacity:
+                    self._evict_overflow(current_version, incoming_entry=entry)
+            except BaseException:
+                for index, queued_entry in enumerate(self._entries):
+                    if queued_entry is entry:
+                        self._entries.pop(index)
+                        self.entered_groups -= 1
+                        break
+                self._cond.notify_all()
+                raise
             self._cond.notify_all()
 
     async def get(self) -> BufferEntry:
@@ -269,23 +281,40 @@ class DataBuffer:
             return (float("inf"), float("inf"))
         return (min(versions), sum(versions))
 
-    def _evict_overflow(self, current_version: int | None) -> None:
-        """Evict stalest-first until nothing is beyond ``max_staleness`` and the buffer fits."""
-        while self._entries:
+    def _evict_overflow(
+        self,
+        current_version: int | None,
+        *,
+        incoming_entry: BufferEntry,
+    ) -> None:
+        if self._max_staleness is not None and current_version is not None:
+            eviction_order = sorted(
+                (entry for entry in self._entries if entry is not incoming_entry),
+                key=lambda entry: self._eviction_key(entry[1]),
+            )
+            eviction_order.append(incoming_entry)
+            for entry in eviction_order:
+                source, group = entry
+                oldest = group_oldest_weight_version(group)
+                too_stale = oldest is not None and current_version - oldest > self._max_staleness
+                if not too_stale:
+                    continue
+                index = next(
+                    (index for index, queued_entry in enumerate(self._entries) if queued_entry is entry),
+                    None,
+                )
+                if index is None:
+                    continue
+                self._on_evict(source)
+                self._entries.pop(index)
+                self.evicted_stale_groups += 1
+        while len(self._entries) > self._capacity:
             keys = [self._eviction_key(group) for _, group in self._entries]
             index = keys.index(min(keys))
-            if_exceed_staleness = (
-                self._max_staleness is not None
-                and current_version is not None
-                and current_version - keys[index][0] > self._max_staleness
-            )
-            if not if_exceed_staleness and len(self._entries) <= self._capacity:
-                return
-            if if_exceed_staleness:
-                self.evicted_stale_groups += 1
-            else:
-                self.evicted_overflow_groups += 1
-            self._on_evict(self._entries.pop(index)[0])
+            source, _ = self._entries[index]
+            self._on_evict(source)
+            self._entries.pop(index)
+            self.evicted_overflow_groups += 1
 
     def staleness_stats(self, current_version: int | None) -> tuple[float, int] | None:
         """(average, max) staleness across buffered groups, or None when unknown."""
@@ -305,16 +334,16 @@ class DataBuffer:
         self.evicted_stale_groups = 0
         self.evicted_overflow_groups = 0
 
-    async def discard_all(self, on_discard: Callable[[BufferSource], None]) -> Exception | None:
+    async def discard_all(self, on_discard: Callable[[BufferSource], None]) -> BaseException | None:
         """Discard buffered entries after their ownership settlement succeeds."""
-        first_error: Exception | None = None
+        first_error: BaseException | None = None
         async with self._cond:
             index = 0
             while index < len(self._entries):
                 source, _ = self._entries[index]
                 try:
                     on_discard(source)
-                except Exception as error:
+                except BaseException as error:
                     if first_error is None:
                         first_error = error
                     index += 1
@@ -369,6 +398,16 @@ class FullyAsyncRolloutFn:
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._weight_version = _CachedWeightVersion()
         self._worker: asyncio.Task | None = None
+        self._closing = False
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._executor_closed = False
+        self._worker_error: BaseException | None = None
+        self._worker_failure_reported = False
+        self._legacy_executions: dict[asyncio.Task[LegacyBufferedGroup], list[Sample]] = {}
+        self._legacy_requeued_groups: deque[LegacyBufferedGroup] = deque()
+        self._legacy_close_pending_groups: deque[list[Sample]] = deque()
+        self._active_drains: set[asyncio.Task[RolloutFnTrainOutput]] = set()
         self._eval_prompt_dataset_cache: dict = {}
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
@@ -399,6 +438,8 @@ class FullyAsyncRolloutFn:
             asyncio.Task[_OwnedTerminalResult],
             _ActiveOwnedExecution,
         ] = {}
+        self._pending_reserved_rollbacks: list[SourceReservation] = []
+        self._pending_terminal_rollbacks: list[tuple[ReservationTerminalReceipt, bool]] = []
         self._pending_aborted_groups_recycled = 0
         self._next_execution_id = 1
         self._completed_slots: asyncio.Queue[object] | None = None
@@ -411,6 +452,8 @@ class FullyAsyncRolloutFn:
             self._completed_slot_available.set()
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
+        if self._closing:
+            raise RuntimeError("Fully async rollout function is closed.")
         if input.evaluation:
             return await self._call_eval(input)
         if self._worker is None:
@@ -423,7 +466,188 @@ class FullyAsyncRolloutFn:
             )
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
-        return await self._drain(input.rollout_id)
+        drain_task = asyncio.create_task(self._drain(input.rollout_id))
+        self._active_drains.add(drain_task)
+        try:
+            return await drain_task
+        finally:
+            self._active_drains.discard(drain_task)
+
+    async def close(self) -> None:
+        """Stop rollout production and settle every retained reservation.
+
+        Returns:
+            None after active executions are terminal and retained reservations
+            are requeued.
+
+        Raises:
+            BaseException: The first cleanup or terminal execution failure. A
+                later call retries retained cleanup that did not settle.
+        """
+        if self._closed:
+            return
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(self._close())
+            self._close_task = close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await _await_task_terminal(close_task)
+            except BaseException as terminal_error:
+                raise cancellation from terminal_error
+            raise
+        finally:
+            if self._close_task is close_task and close_task.done() and not self._closed:
+                self._close_task = None
+
+    async def _close(self) -> None:
+        self._closing = True
+        cleanup_error: BaseException | None = None
+        shutdown_error: BaseException | None = None
+
+        worker = self._worker
+        if worker is not None:
+            if not worker.done():
+                worker.cancel()
+            worker_result: None | BaseException = (await asyncio.gather(worker, return_exceptions=True))[0]
+            if not self._worker_failure_reported:
+                recorded_worker_error = self._worker_error
+                if recorded_worker_error is not None and not isinstance(recorded_worker_error, asyncio.CancelledError):
+                    shutdown_error = recorded_worker_error
+                elif isinstance(worker_result, BaseException) and not isinstance(
+                    worker_result, asyncio.CancelledError
+                ):
+                    shutdown_error = worker_result
+
+        legacy_executions = tuple(self._legacy_executions.items())
+        for task, _ in legacy_executions:
+            if not task.done():
+                task.cancel()
+        if legacy_executions:
+            results = await asyncio.gather(
+                *(task for task, _ in legacy_executions),
+                return_exceptions=True,
+            )
+            for (task, source_group), _ in zip(legacy_executions, results, strict=True):
+                self._legacy_close_pending_groups.append(source_group)
+                self._legacy_executions.pop(task, None)
+
+        active_drains = tuple(self._active_drains)
+        if active_drains:
+            await asyncio.gather(*active_drains, return_exceptions=True)
+
+        output = self._output
+        if not self._uses_owned_capacity and output is not None:
+
+            def retain_legacy_source(source: BufferSource) -> None:
+                if isinstance(source, _OwnedCompletedGroup):
+                    raise RuntimeError("Legacy fully async output buffer contained an owned group.")
+                self._legacy_close_pending_groups.append(source)
+
+            buffered_retain_error = await output.discard_all(retain_legacy_source)
+            if buffered_retain_error is not None:
+                cleanup_error = buffered_retain_error
+            while self._legacy_requeued_groups:
+                source_group, _ = self._legacy_requeued_groups.popleft()
+                self._legacy_close_pending_groups.append(source_group)
+
+        legacy_recycle_error = self._retry_pending_legacy_recycles()
+        if legacy_recycle_error is not None:
+            cleanup_error = legacy_recycle_error
+
+        acquisition_rollback_error = self._retry_pending_acquisition_rollback()
+        if cleanup_error is None:
+            cleanup_error = acquisition_rollback_error
+
+        reserved_rollback_error = self._retry_pending_reserved_rollbacks()
+        if cleanup_error is None:
+            cleanup_error = reserved_rollback_error
+
+        pending_rollback_error = self._retry_pending_terminal_rollbacks()
+        if cleanup_error is None:
+            cleanup_error = pending_rollback_error
+
+        active = list(self._active_executions.items())
+        terminal_waits: list[
+            tuple[
+                asyncio.Task[_OwnedTerminalResult],
+                _ActiveOwnedExecution,
+            ]
+        ] = []
+        for terminal_task, active_execution in active:
+            if _terminal_observation_needs_retry(terminal_task):
+                replacement: asyncio.Task[_OwnedTerminalResult] = asyncio.create_task(
+                    active_execution.observe_terminal()
+                )
+                del self._active_executions[terminal_task]
+                self._active_executions[replacement] = active_execution
+                terminal_task = replacement
+            if not terminal_task.done():
+                try:
+                    active_execution.execution.request_cancellation()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    continue
+            terminal_waits.append((terminal_task, active_execution))
+
+        for terminal_task, _ in terminal_waits:
+            try:
+                result = await asyncio.shield(terminal_task)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                continue
+            if not isinstance(result, (_OwnedCompletedGroup, _OwnedExecutionRetry, _OwnedExecutionFailure)):
+                if cleanup_error is None:
+                    cleanup_error = RuntimeError(f"Fully async close observed unsupported {type(result).__name__}.")
+                continue
+            try:
+                self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=False)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                continue
+            self._active_executions.pop(terminal_task, None)
+            if (
+                isinstance(result, _OwnedExecutionFailure)
+                and not isinstance(result.error, asyncio.CancelledError)
+                and shutdown_error is None
+            ):
+                shutdown_error = result.error
+
+        if self._uses_owned_capacity and output is not None:
+            queued_error = await self._rollback_queued_owned_groups(output)
+            if cleanup_error is None:
+                cleanup_error = queued_error
+
+        if not self._active_executions and not self._executor_closed and self._executor is not None:
+            try:
+                await self._executor.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            else:
+                self._executor_closed = True
+
+        if cleanup_error is not None:
+            raise cleanup_error
+        if self._active_executions:
+            raise RuntimeError("Fully async close did not settle every active execution.")
+        if self._pending_reserved_rollbacks:
+            raise RuntimeError("Fully async close did not settle every retained reserved rollback.")
+        if self._pending_terminal_rollbacks:
+            raise RuntimeError("Fully async close did not settle every retained terminal rollback.")
+        if self._ownership is not None and self._ownership.has_pending_acquisition_rollback:
+            raise RuntimeError("Fully async close did not settle the retained acquisition rollback.")
+        if self._legacy_close_pending_groups:
+            raise RuntimeError("Fully async close did not recycle every retained legacy group.")
+        if shutdown_error is not None:
+            self._worker_failure_reported = True
+            raise shutdown_error
+        self._closed = True
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -489,7 +713,9 @@ class FullyAsyncRolloutFn:
             async def execute_legacy() -> LegacyBufferedGroup:
                 return prompt_group, await self._generate_group(prompt_group)
 
-            return asyncio.create_task(execute_legacy())
+            task = asyncio.create_task(execute_legacy())
+            self._legacy_executions[task] = prompt_group
+            return task
 
         ownership = self._ownership
         retained_slots = self._retained_slots
@@ -523,8 +749,12 @@ class FullyAsyncRolloutFn:
             stage_id = ReservationStageId(f"execution-{self._next_execution_id}")
             self._next_execution_id += 1
             [executor_receipt] = ownership.begin_execution([reservation], stage_id=stage_id)
-        except Exception:
-            ownership.rollback_reserved([reservation])
+        except Exception as validation_error:
+            try:
+                ownership.rollback_reserved([reservation])
+            except BaseException as rollback_error:
+                self._pending_reserved_rollbacks.append(reservation)
+                raise validation_error from rollback_error
             retained_slots.release()
             raise
 
@@ -541,12 +771,13 @@ class FullyAsyncRolloutFn:
             try:
                 ownership.rollback_batch([terminal_receipt])
             except BaseException as settlement_error:
+                self._pending_terminal_rollbacks.append((terminal_receipt, False))
                 raise submission_error from settlement_error
             retained_slots.release()
             raise
         self._scheduler.on_submit([list(reservation.samples)])
 
-        async def observe_terminal() -> _OwnedTerminalResult:
+        async def observe_terminal() -> _OwnedCompletedGroup | _OwnedExecutionRetry | _OwnedExecutionFailure:
             outcome = await execution.wait_terminal()
             if outcome.executor_receipt is not executor_receipt:
                 # A foreign receipt cannot prove this reservation terminal; retain ownership fail-closed.
@@ -679,13 +910,71 @@ class FullyAsyncRolloutFn:
     async def _rollback_queued_owned_groups(
         self,
         output: DataBuffer,
-    ) -> Exception | None:
+    ) -> BaseException | None:
         def rollback(source: BufferSource) -> None:
             if not isinstance(source, _OwnedCompletedGroup):
                 raise RuntimeError(f"Owned fully async output buffer contained unsupported {type(source).__name__}.")
             self._rollback_owned_terminal(source.terminal_receipt, completed_slot_held=True)
 
         return await output.discard_all(rollback)
+
+    def _retry_pending_terminal_rollbacks(self) -> BaseException | None:
+        while self._pending_terminal_rollbacks:
+            terminal_receipt, completed_slot_held = self._pending_terminal_rollbacks[0]
+            try:
+                self._rollback_owned_terminal(
+                    terminal_receipt,
+                    completed_slot_held=completed_slot_held,
+                )
+            except BaseException as error:
+                return error
+            del self._pending_terminal_rollbacks[0]
+        return None
+
+    def _retry_pending_reserved_rollbacks(self) -> BaseException | None:
+        ownership = self._ownership
+        retained_slots = self._retained_slots
+        if ownership is None or retained_slots is None:
+            if self._pending_reserved_rollbacks:
+                return RuntimeError("Fully async ownership capacity is not initialized.")
+            return None
+        while self._pending_reserved_rollbacks:
+            reservation = self._pending_reserved_rollbacks[0]
+            try:
+                ownership.rollback_reserved([reservation])
+            except BaseException as error:
+                return error
+            retained_slots.release()
+            del self._pending_reserved_rollbacks[0]
+        return None
+
+    def _retry_pending_acquisition_rollback(self) -> BaseException | None:
+        ownership = self._ownership
+        retained_slots = self._retained_slots
+        if ownership is None or not ownership.has_pending_acquisition_rollback:
+            return None
+        if retained_slots is None:
+            return RuntimeError("Fully async ownership capacity is not initialized.")
+        try:
+            ownership.retry_failed_acquisition_rollback()
+        except BaseException as error:
+            return error
+        retained_slots.release()
+        return None
+
+    def _retry_pending_legacy_recycles(self) -> BaseException | None:
+        while self._legacy_close_pending_groups:
+            try:
+                self._recycle(self._legacy_close_pending_groups[0])
+            except BaseException as error:
+                return error
+            self._legacy_close_pending_groups.popleft()
+        return None
+
+    def _record_worker_error(self, error: BaseException) -> BaseException:
+        if self._worker_error is None:
+            self._worker_error = error
+        return self._worker_error
 
     async def _worker_loop(self) -> None:
         output = self._output
@@ -717,8 +1006,9 @@ class FullyAsyncRolloutFn:
                         submitted = await self._submit_active_group(active)
                     except Exception as submission_error:
                         if not self._uses_owned_capacity:
+                            self._record_worker_error(submission_error)
                             raise
-                        fatal_error = submission_error
+                        fatal_error = self._record_worker_error(submission_error)
                         break
                     if not submitted:
                         break
@@ -785,29 +1075,63 @@ class FullyAsyncRolloutFn:
                     done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             else:
                 done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                continue
+            if not self._uses_owned_capacity:
+                completed_groups: list[LegacyBufferedGroup] = []
+                done_source_groups: list[list[Sample]] = []
+                task_error: BaseException | None = None
+                for task in done:
+                    legacy_task = cast(asyncio.Task[LegacyBufferedGroup], task)
+                    source_group = self._legacy_executions[legacy_task]
+                    done_source_groups.append(source_group)
+                    try:
+                        completed_group = legacy_task.result()
+                    except BaseException as error:
+                        if task_error is None:
+                            task_error = error
+                    else:
+                        completed_groups.append(completed_group)
+                if task_error is not None:
+                    active_tasks = [cast(asyncio.Task[LegacyBufferedGroup], task) for task in active]
+                    active_source_groups = [self._legacy_executions[task] for task in active_tasks]
+                    for task in active_tasks:
+                        task.cancel()
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                    self._legacy_close_pending_groups.extend(done_source_groups)
+                    self._legacy_close_pending_groups.extend(active_source_groups)
+                    for task in done:
+                        self._legacy_executions.pop(cast(asyncio.Task[LegacyBufferedGroup], task), None)
+                    for task in active_tasks:
+                        self._legacy_executions.pop(task, None)
+                    self._record_worker_error(task_error)
+                    raise task_error
+                for task in done:
+                    self._legacy_executions.pop(cast(asyncio.Task[LegacyBufferedGroup], task), None)
+                for position, completed_group in enumerate(completed_groups):
+                    try:
+                        version = await self._weight_version.get(self.args)
+                        await output.put(completed_group, current_version=version)
+                    except BaseException as error:
+                        self._legacy_requeued_groups.extend(completed_groups[position:])
+                        self._record_worker_error(error)
+                        raise
+                continue
             for task in done:
-                if not self._uses_owned_capacity:
-                    result = task.result()
-                    if not isinstance(result, tuple):
-                        raise RuntimeError(
-                            f"Legacy fully async execution returned unsupported {type(result).__name__}."
-                        )
-                    version = await self._weight_version.get(self.args)
-                    await output.put(result, current_version=version)
-                    continue
                 owned_task = cast(asyncio.Task[_OwnedTerminalResult], task)
                 try:
                     result = owned_task.result()
                 except BaseException as task_error:
                     if fatal_error is None:
-                        fatal_error = task_error
+                        fatal_error = self._record_worker_error(task_error)
                     continue
                 if isinstance(result, _OwnedExecutionRetry):
                     try:
                         self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=False)
-                    except Exception as settlement_error:
+                    except BaseException as settlement_error:
+                        self._pending_terminal_rollbacks.append((result.terminal_receipt, False))
                         if fatal_error is None:
-                            fatal_error = settlement_error
+                            fatal_error = self._record_worker_error(settlement_error)
                     else:
                         if result.reason is FullyAsyncRetryReason.EXECUTION_ABORTED:
                             self._pending_aborted_groups_recycled += 1
@@ -816,11 +1140,12 @@ class FullyAsyncRolloutFn:
                 if isinstance(result, _OwnedExecutionFailure):
                     try:
                         self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=False)
-                    except Exception as settlement_error:
+                    except BaseException as settlement_error:
+                        self._pending_terminal_rollbacks.append((result.terminal_receipt, False))
                         if fatal_settlement_error is None:
                             fatal_settlement_error = settlement_error
                     if fatal_error is None:
-                        fatal_error = result.error
+                        fatal_error = self._record_worker_error(result.error)
                     self._active_executions.pop(owned_task, None)
                     continue
                 if not isinstance(result, _OwnedCompletedGroup):
@@ -828,30 +1153,27 @@ class FullyAsyncRolloutFn:
                 if fatal_error is not None or not self._try_acquire_completed_slot():
                     try:
                         self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=False)
-                    except Exception as settlement_error:
+                    except BaseException as settlement_error:
+                        self._pending_terminal_rollbacks.append((result.terminal_receipt, False))
                         if fatal_error is None:
-                            fatal_error = settlement_error
+                            fatal_error = self._record_worker_error(settlement_error)
                         elif fatal_settlement_error is None:
                             fatal_settlement_error = settlement_error
                     self._active_executions.pop(owned_task, None)
                     continue
                 try:
                     version = await self._weight_version.get(self.args)
-                except Exception as version_error:
+                    await output.put((result, result.samples), current_version=version)
+                except BaseException as buffer_error:
                     try:
                         self._rollback_owned_terminal(result.terminal_receipt, completed_slot_held=True)
-                    except Exception as settlement_error:
+                    except BaseException as settlement_error:
+                        self._pending_terminal_rollbacks.append((result.terminal_receipt, True))
                         if fatal_settlement_error is None:
                             fatal_settlement_error = settlement_error
-                    if fatal_error is None:
-                        fatal_error = version_error
                     self._active_executions.pop(owned_task, None)
-                    continue
-                try:
-                    await output.put((result, result.samples), current_version=version)
-                except Exception as buffer_error:
                     if fatal_error is None:
-                        fatal_error = buffer_error
+                        fatal_error = self._record_worker_error(buffer_error)
                 else:
                     self._active_executions.pop(owned_task, None)
 
@@ -862,6 +1184,8 @@ class FullyAsyncRolloutFn:
         worker = self._worker
         if output is None or worker is None:
             raise RuntimeError("Fully async worker is not initialized.")
+        if self._legacy_requeued_groups:
+            return self._legacy_requeued_groups.popleft()
         queue_get = asyncio.create_task(output.get())
         try:
             while True:
@@ -877,9 +1201,34 @@ class FullyAsyncRolloutFn:
                 if queue_get in done:
                     return queue_get.result()
                 logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s (queued: {output.qsize()})")
-        finally:
-            if not queue_get.done():
-                queue_get.cancel()
+        except BaseException as error:
+            try:
+                await self._settle_failed_queue_get(queue_get, output)
+            except BaseException as settlement_error:
+                raise error from settlement_error
+            raise
+
+    async def _settle_failed_queue_get(
+        self,
+        queue_get: asyncio.Task[BufferEntry],
+        output: DataBuffer,
+    ) -> None:
+        if not queue_get.done():
+            queue_get.cancel()
+        await asyncio.gather(queue_get, return_exceptions=True)
+        if queue_get.cancelled():
+            return
+
+        completed = queue_get.result()
+        source, _ = completed
+        if isinstance(source, _OwnedCompletedGroup):
+            try:
+                self._rollback_owned_terminal(source.terminal_receipt, completed_slot_held=True)
+            except BaseException:
+                self._pending_terminal_rollbacks.append((source.terminal_receipt, True))
+                raise
+            return
+        self._legacy_requeued_groups.append(completed)
 
     async def _drain(self, rollout_id: int) -> RolloutFnTrainOutput:
         args = self.args
@@ -890,6 +1239,8 @@ class FullyAsyncRolloutFn:
 
         target_data_size = args.rollout_batch_size
         data: list[Group] = []
+        accepted_legacy_groups: list[LegacyBufferedGroup] = []
+        claimed_legacy_group: LegacyBufferedGroup | None = None
         terminal_receipts: list[ReservationTerminalReceipt] = []
         aborted_groups_recycled = 0
         stale_groups_recycled = 0
@@ -899,7 +1250,8 @@ class FullyAsyncRolloutFn:
 
         try:
             while len(data) < target_data_size:
-                source, group = await self._next_group()
+                buffered_group = await self._next_group()
+                source, group = buffered_group
                 if isinstance(source, _OwnedCompletedGroup):
                     prompt_group = None
                     terminal_receipt = source.terminal_receipt
@@ -907,6 +1259,7 @@ class FullyAsyncRolloutFn:
                 else:
                     prompt_group = source
                     terminal_receipt = None
+                    claimed_legacy_group = buffered_group
 
                 if len(group) != args.n_samples_per_prompt:
                     if terminal_receipt is None:
@@ -928,6 +1281,7 @@ class FullyAsyncRolloutFn:
                     if terminal_receipt is None:
                         assert prompt_group is not None
                         self._recycle(prompt_group)
+                        claimed_legacy_group = None
                     else:
                         self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
                         assert terminal_receipts.pop() is terminal_receipt
@@ -943,6 +1297,7 @@ class FullyAsyncRolloutFn:
                         if terminal_receipt is None:
                             assert prompt_group is not None
                             self._recycle(prompt_group)
+                            claimed_legacy_group = None
                         else:
                             self._rollback_owned_terminal(terminal_receipt, completed_slot_held=True)
                             assert terminal_receipts.pop() is terminal_receipt
@@ -962,6 +1317,8 @@ class FullyAsyncRolloutFn:
                             completed_slot_held=True,
                         )
                         assert terminal_receipts.pop() is terminal_receipt
+                    else:
+                        claimed_legacy_group = None
                     # Filtered groups are consumed, not replayed: they have no usable gradient signal.
                     metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                     continue
@@ -975,6 +1332,9 @@ class FullyAsyncRolloutFn:
                     do_print = False
 
                 data.append(group)
+                if terminal_receipt is None:
+                    accepted_legacy_groups.append(buffered_group)
+                claimed_legacy_group = None
 
             sample = _first_sample(data[-1])
             logger.info(
@@ -984,13 +1344,16 @@ class FullyAsyncRolloutFn:
 
             data.sort(key=lambda group: _first_sample(group).index)
 
+            if self._uses_owned_capacity and self._closing:
+                raise RuntimeError("Fully async rollout closed before the train batch lease was issued.")
+
             if self._sample_filter is not None:
                 self._sample_filter(args, data)
 
             aborted_groups_recycled += self._pending_aborted_groups_recycled
             self._pending_aborted_groups_recycled = 0
-            metrics = {
-                "rollout/fully_async/queue_size": output.qsize(),
+            metrics: dict[str, int | float] = {
+                "rollout/fully_async/queue_size": output.qsize() + len(self._legacy_requeued_groups),
                 "rollout/fully_async/aborted_groups_recycled": aborted_groups_recycled,
                 "rollout/fully_async/stale_groups_recycled": stale_groups_recycled,
                 "rollout/fully_async/evicted_stale_groups": output.evicted_stale_groups,
@@ -1030,6 +1393,15 @@ class FullyAsyncRolloutFn:
                 )
             return RolloutFnTrainOutput(samples=data, metrics=metrics)
         except BaseException as error:
+            if not self._uses_owned_capacity:
+                worker = self._worker
+                retained_groups = list(accepted_legacy_groups)
+                if claimed_legacy_group is not None:
+                    retained_groups.append(claimed_legacy_group)
+                if self._closing or (worker is not None and worker.done()):
+                    self._legacy_close_pending_groups.extend(source_group for source_group, _ in retained_groups)
+                else:
+                    self._legacy_requeued_groups.extend(retained_groups)
             if terminal_receipts:
                 try:
                     self._rollback_owned_terminals(
@@ -1037,6 +1409,9 @@ class FullyAsyncRolloutFn:
                         completed_slots=len(terminal_receipts),
                     )
                 except BaseException as settlement_error:
+                    self._pending_terminal_rollbacks.extend(
+                        (terminal_receipt, True) for terminal_receipt in terminal_receipts
+                    )
                     raise error from settlement_error
             raise
 
@@ -1050,3 +1425,20 @@ class FullyAsyncRolloutFn:
         for sample in prompt_group:
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])
+
+
+async def _await_task_terminal(task: asyncio.Task[_T]) -> _T:
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
+def _terminal_observation_needs_retry(task: asyncio.Task[_OwnedTerminalResult]) -> bool:
+    if not task.done():
+        return False
+    if task.cancelled():
+        return True
+    return isinstance(task.exception(), FullyAsyncTerminalPendingError)
