@@ -1,3 +1,4 @@
+import asyncio
 import atexit
 import logging
 import os
@@ -612,8 +613,8 @@ class MegatronTrainRayActor(TrainRayActor):
         broadcast_buffer = [None]
         if is_first_replica_megatron_main_rank():
             controller = get_multi_lora_controller()
-            ray.get(controller.retire_adapters.remote())
-            broadcast_buffer[0] = ray.get(controller.snapshot.remote())
+            asyncio.run(controller.retire_adapters())
+            broadcast_buffer[0] = asyncio.run(controller.snapshot())
         if dist.is_initialized():
             dist.broadcast_object_list(broadcast_buffer, src=0, group=get_gloo_group())
         snapshot = broadcast_buffer[0]
@@ -647,7 +648,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # Deregistered before ever being loaded: nothing to save or clear.
         if is_first_replica_megatron_main_rank():
             for name in cleanup_names - loaded_names:
-                ray.get(get_multi_lora_controller().free_slot.remote(name))
+                asyncio.run(get_multi_lora_controller().free_slot(name))
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
