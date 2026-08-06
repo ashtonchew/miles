@@ -36,40 +36,92 @@ def render_cli_argv(
     dest_prefix: str = "",
     field_to_dest: Mapping[str, str] | None = None,
 ) -> list[str]:
-    parser = make_parser()
+    actions_by_dest = _actions_by_dest(make_parser())
 
     def parse(argv: list[str]) -> _ArgsT:
         return from_parsed(make_parser().parse_args(argv))
 
+    def render_fields(rendered_field_names: frozenset[str]) -> list[str]:
+        return _render_fields(
+            args_obj,
+            field_names=rendered_field_names,
+            actions_by_dest=actions_by_dest,
+            dest_prefix=dest_prefix,
+            field_to_dest=field_to_dest or {},
+        )
+
     base_argv = list(required_argv or [])
-    argv = base_argv + _render_cli_argv(
-        args_obj,
-        cli_defaults=parse(base_argv),
-        parser=parser,
-        dest_prefix=dest_prefix,
-        field_to_dest=field_to_dest or {},
-    )
+    field_names: frozenset[str] = frozenset()
+    max_passes = len(dataclasses.fields(args_obj)) + 2
+
+    for skip_structured in (True, False):
+        for _ in range(max_passes):
+            next_field_names = _select_field_names(
+                args_obj,
+                parse=parse,
+                render_fields=render_fields,
+                base_argv=base_argv,
+                field_names=field_names,
+                skip_structured=skip_structured,
+            )
+            if next_field_names == field_names:
+                break
+            field_names = next_field_names
+        else:
+            raise AssertionError(
+                f"cli argv rendering did not converge within {max_passes} passes: {sorted(field_names)}"
+            )
+
+    argv = base_argv + render_fields(field_names)
 
     parsed = parse(argv)
     assert parsed == args_obj, f"cli argv roundtrip mismatch: {parsed!r} != {args_obj!r}"
     return argv
 
 
-def _render_cli_argv(
+def _select_field_names(
     args_obj: _ArgsT,
     *,
-    cli_defaults: _ArgsT,
-    parser: argparse.ArgumentParser,
+    parse: Callable[[list[str]], _ArgsT],
+    render_fields: Callable[[frozenset[str]], list[str]],
+    base_argv: list[str],
+    field_names: frozenset[str],
+    skip_structured: bool,
+) -> frozenset[str]:
+    def implied_by(rendered_field_names: frozenset[str]) -> _ArgsT:
+        return parse(base_argv + render_fields(rendered_field_names))
+
+    missing = _candidate_field_names(args_obj, cli_defaults=implied_by(field_names), skip_structured=skip_structured)
+    still_needed = {
+        name for name in field_names if getattr(args_obj, name) != getattr(implied_by(field_names - {name}), name)
+    }
+
+    return missing | frozenset(still_needed)
+
+
+def _candidate_field_names(args_obj: _ArgsT, *, cli_defaults: _ArgsT, skip_structured: bool = False) -> frozenset[str]:
+    return frozenset(
+        field.name
+        for field in dataclasses.fields(args_obj)
+        if (value := getattr(args_obj, field.name)) is not None
+        and not (skip_structured and dataclasses.is_dataclass(value))
+        and value != getattr(cli_defaults, field.name)
+    )
+
+
+def _render_fields(
+    args_obj: _ArgsT,
+    *,
+    field_names: frozenset[str],
+    actions_by_dest: dict[str, argparse.Action],
     dest_prefix: str,
     field_to_dest: Mapping[str, str],
 ) -> list[str]:
-    actions_by_dest = _actions_by_dest(parser)
-
     argv: list[str] = []
     for field in dataclasses.fields(args_obj):
-        value = getattr(args_obj, field.name)
-        if value == getattr(cli_defaults, field.name):
+        if field.name not in field_names:
             continue
+        value = getattr(args_obj, field.name)
 
         action = _resolve_action(
             actions_by_dest, field_name=field.name, dest_prefix=dest_prefix, field_to_dest=field_to_dest
@@ -130,8 +182,17 @@ def _render_action_argv(action: argparse.Action, value: object) -> list[str]:
 
     if action.nargs in ("*", "+") or isinstance(action.nargs, int):
         if isinstance(value, dict):
+            assert all(
+                item is not None for item in value.values()
+            ), f"{flag} cannot be rendered: a None value in {action.dest} cannot round-trip through the CLI"
             return [flag, *(f"{key}={item}" for key, item in value.items())]
+        assert all(
+            item is not None for item in value
+        ), f"{flag} cannot be rendered: a None element of {action.dest} cannot round-trip through the CLI"
         return [flag, *(str(item) for item in value)]
+
+    if dataclasses.is_dataclass(value):
+        return [flag, json.dumps(dataclasses.asdict(value))]
 
     if isinstance(value, dict | list | tuple):
         return [flag, json.dumps(value)]

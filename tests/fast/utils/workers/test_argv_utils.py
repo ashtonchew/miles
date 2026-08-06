@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import json
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -10,7 +11,15 @@ from miles.rollout.session.config import SessionServerConfig
 from miles.router.config import MilesRouterConfig
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 from miles.utils.workers import argv_utils
-from miles.utils.workers.argv_utils import CONFIG_JSON_FLAG, config_to_argv, parse_config_argv, render_cli_argv
+from miles.utils.workers.argv_utils import (
+    CONFIG_JSON_FLAG,
+    _actions_by_dest,
+    _candidate_field_names,
+    _render_fields,
+    config_to_argv,
+    parse_config_argv,
+    render_cli_argv,
+)
 
 
 class _DemoConfig(FrozenStrictBaseModel):
@@ -319,6 +328,258 @@ class TestRenderCliArgvAgainstTheRealParserShape:
                 from_parsed=lambda parsed: _UnknownArgs(),
                 dest_prefix="router_",
             )
+
+
+def _render_selected(
+    args_obj: Any, *, cli_defaults: Any, make_parser: Callable[[], argparse.ArgumentParser]
+) -> list[str]:
+    return _render_fields(
+        args_obj,
+        field_names=_candidate_field_names(args_obj, cli_defaults=cli_defaults),
+        actions_by_dest=_actions_by_dest(make_parser()),
+        dest_prefix="",
+        field_to_dest={},
+    )
+
+
+@dataclasses.dataclass
+class _NullableArgs:
+    text: str | None = "text-default"
+    number: int | None = 7
+    items: list[str] | None = None
+    mapping: dict[str, str] | None = None
+
+
+def _make_nullable_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--text", default="text-default")
+    parser.add_argument("--number", type=int, default=7)
+    parser.add_argument("--items", nargs="*", default=None)
+    parser.add_argument("--mapping", nargs="*", default=None)
+    return parser
+
+
+def _render_nullable(args_obj: _NullableArgs, *, cli_defaults: _NullableArgs) -> list[str]:
+    return _render_selected(args_obj, cli_defaults=cli_defaults, make_parser=_make_nullable_parser)
+
+
+@dataclasses.dataclass
+class _DerivedArgs:
+    mode: str = "off"
+    label: str | None = None
+    count: int = 0
+    verbose: bool = False
+
+
+def _make_derived_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="off")
+    parser.add_argument("--label", default=None)
+    parser.add_argument("--count", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def _from_parsed_derived(parsed: argparse.Namespace) -> _DerivedArgs:
+    return _DerivedArgs(
+        mode=parsed.mode,
+        label=parsed.label if parsed.mode == "on" else "off-label",
+        count=parsed.count,
+        verbose=parsed.verbose,
+    )
+
+
+class TestRenderCliArgvNoneHandling:
+    def test_a_none_value_is_omitted_instead_of_stringified(self):
+        """A None-valued option disappears rather than rendering the literal word None."""
+        argv = _render_nullable(_NullableArgs(text=None), cli_defaults=_NullableArgs())
+        assert argv == []
+        assert "None" not in argv
+
+    def test_a_none_value_is_omitted_even_when_the_cli_default_differs(self):
+        """None never renders a value, whatever the CLI default for that option is."""
+        argv = _render_nullable(_NullableArgs(text=None, number=None), cli_defaults=_NullableArgs(text="other"))
+        assert argv == []
+
+    def test_a_none_list_or_dict_option_is_omitted(self):
+        """Nullable list and dict options vanish when they are None."""
+        argv = _render_nullable(_NullableArgs(items=None, mapping=None), cli_defaults=_NullableArgs(items=["a"]))
+        assert argv == []
+
+    def test_an_empty_string_value_is_still_rendered(self):
+        """The empty string is a real value and keeps its flag and argument."""
+        argv = _render_nullable(_NullableArgs(text=""), cli_defaults=_NullableArgs())
+        assert argv == ["--text", ""]
+
+    def test_empty_string_survives_a_full_roundtrip(self):
+        """An empty-string option parses back to an equal object."""
+        args_obj = _make_cli_default_args(name="")
+        argv = _render(args_obj)
+        assert argv == ["--name", ""]
+        assert _parse(argv) == args_obj
+
+    def test_falsy_but_not_none_values_are_rendered(self):
+        """Zero and empty containers render, unlike None."""
+        argv = _render_nullable(_NullableArgs(number=0, items=[], mapping={}), cli_defaults=_NullableArgs(items=["a"]))
+        assert argv == ["--number", "0", "--items", "--mapping"]
+
+    def test_a_false_flag_matching_its_cli_default_is_omitted(self):
+        """A store-true flag left False is absent because that is its parsed value."""
+        args_obj = _make_cli_default_args(verbose=False, count=2)
+        argv = _render(args_obj)
+        assert "--verbose" not in argv
+        assert _parse(argv) == args_obj
+
+    def test_a_zero_value_differing_from_the_cli_default_is_rendered(self):
+        """A numeric zero that differs from the CLI default reaches the command line."""
+        args_obj = _make_cli_default_args(ratio=0.0)
+        argv = _render(args_obj)
+        assert argv == ["--ratio", "0.0"]
+        assert _parse(argv) == args_obj
+
+    def test_a_derived_none_field_roundtrips_once_the_flag_is_omitted(self):
+        """Omitting a None option lets a derived field parse back to None."""
+        args_obj = _DerivedArgs(mode="on", label=None)
+        argv = render_cli_argv(args_obj, make_parser=_make_derived_parser, from_parsed=_from_parsed_derived)
+        assert argv == ["--mode", "on"]
+        assert _from_parsed_derived(_make_derived_parser().parse_args(argv)) == args_obj
+
+    def test_a_none_element_of_a_list_fails_loudly_instead_of_rendering_the_word_none(self):
+        """A None inside a list value aborts naming the field instead of emitting "None"."""
+        with pytest.raises(AssertionError, match="--items cannot be rendered.*items"):
+            _render_nullable(_NullableArgs(items=["a", None]), cli_defaults=_NullableArgs())
+
+    def test_a_none_value_in_a_dict_fails_loudly_instead_of_rendering_the_word_none(self):
+        """A None inside a dict value aborts naming the field instead of emitting "key=None"."""
+        with pytest.raises(AssertionError, match="--mapping cannot be rendered.*mapping"):
+            _render_nullable(_NullableArgs(mapping={"k": None}), cli_defaults=_NullableArgs())
+
+    def test_a_none_inside_a_container_never_reaches_the_rendered_argv(self):
+        """Regression: rendering a list holding None used to produce the literal string "None"."""
+        with pytest.raises(AssertionError, match="cannot be rendered"):
+            _render(_make_cli_default_args(items=["a", None]))
+
+    def test_render_parse_render_is_stable(self):
+        """Reparsing a rendered argv and rendering again yields the identical argv."""
+        args_obj = _make_cli_default_args(
+            name="other",
+            count=3,
+            ratio=0.0,
+            verbose=True,
+            items=["a", "b"],
+            mapping={"k1": "v1"},
+            cli_filled=None,
+        )
+        first = _render_selected(args_obj, cli_defaults=_parse([]), make_parser=_make_parser)
+        second = _render_selected(_parse(first), cli_defaults=_parse([]), make_parser=_make_parser)
+        assert first == second
+        assert "None" not in first
+
+
+@dataclasses.dataclass
+class _GraphConfig:
+    backend: str = "eager"
+    max_bs: int = 4
+
+
+@dataclasses.dataclass
+class _StructuredArgs:
+    max_bs: int = 4
+    graph: _GraphConfig | None = None
+
+
+def _make_structured_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-bs", type=int, default=4)
+    parser.add_argument("--graph", type=lambda raw: _GraphConfig(**json.loads(raw)), default=None)
+    return parser
+
+
+def _from_parsed_structured(parsed: argparse.Namespace) -> _StructuredArgs:
+    graph = parsed.graph if parsed.graph is not None else _GraphConfig(max_bs=parsed.max_bs)
+    return _StructuredArgs(max_bs=parsed.max_bs, graph=graph)
+
+
+def _render_structured(args_obj: _StructuredArgs) -> list[str]:
+    return render_cli_argv(args_obj, make_parser=_make_structured_parser, from_parsed=_from_parsed_structured)
+
+
+class TestRenderCliArgvDataclassFields:
+    def test_a_derived_dataclass_field_that_the_other_flags_imply_is_not_rendered(self):
+        """Regression: a post-parse derived dataclass used to be emitted as an unparseable Python repr."""
+        args_obj = _StructuredArgs(max_bs=16, graph=_GraphConfig(max_bs=16))
+
+        assert _render_structured(args_obj) == ["--max-bs", "16"]
+
+    def test_a_derived_dataclass_field_never_reaches_the_argv_as_a_repr(self):
+        """The rendered argv must not contain the dataclass constructor text under any flag."""
+        argv = _render_structured(_StructuredArgs(max_bs=16, graph=_GraphConfig(max_bs=16)))
+
+        assert not any("_GraphConfig(" in item for item in argv)
+
+    def test_a_user_set_dataclass_field_roundtrips_as_json(self):
+        """A dataclass value the other flags do not imply is serialized so the parser can read it back."""
+        args_obj = _StructuredArgs(max_bs=16, graph=_GraphConfig(backend="cuda-graph", max_bs=99))
+        argv = _render_structured(args_obj)
+
+        assert argv == ["--max-bs", "16", "--graph", json.dumps({"backend": "cuda-graph", "max_bs": 99})]
+        assert _from_parsed_structured(_make_structured_parser().parse_args(argv)) == args_obj
+
+    def test_a_dataclass_field_equal_to_the_bare_cli_default_is_not_rendered(self):
+        """The plain defaults check still short-circuits before the derived-default comparison."""
+        assert _render_structured(_StructuredArgs(max_bs=4, graph=_GraphConfig())) == []
+
+
+@dataclasses.dataclass
+class _SentinelArgs:
+    disaggregation_mode: str = "null"
+    load_balance_method: str = "round_robin"
+    count: int = 0
+
+
+def _make_sentinel_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--disaggregation-mode", default="null")
+    parser.add_argument("--load-balance-method", default="auto")
+    parser.add_argument("--count", type=int, default=0)
+    return parser
+
+
+def _from_parsed_sentinel(parsed: argparse.Namespace) -> _SentinelArgs:
+    load_balance_method = parsed.load_balance_method
+    if load_balance_method == "auto":
+        load_balance_method = "follow_bootstrap_room" if parsed.disaggregation_mode == "prefill" else "round_robin"
+    return _SentinelArgs(
+        disaggregation_mode=parsed.disaggregation_mode,
+        load_balance_method=load_balance_method,
+        count=parsed.count,
+    )
+
+
+def _render_sentinel(args_obj: _SentinelArgs) -> list[str]:
+    return render_cli_argv(args_obj, make_parser=_make_sentinel_parser, from_parsed=_from_parsed_sentinel)
+
+
+class TestRenderCliArgvSentinelResolvedDefaults:
+    def test_a_field_another_flag_re_resolves_is_still_rendered(self):
+        """Regression: a prefill engine's round_robin used to be elided because the flagless baseline agreed."""
+        args_obj = _SentinelArgs(disaggregation_mode="prefill", load_balance_method="round_robin")
+        argv = _render_sentinel(args_obj)
+
+        assert argv == ["--disaggregation-mode", "prefill", "--load-balance-method", "round_robin"]
+        assert _from_parsed_sentinel(_make_sentinel_parser().parse_args(argv)) == args_obj
+
+    def test_a_field_the_other_flags_already_imply_stays_off_the_command_line(self):
+        """The baseline follows the emitted flags, so a value they resolve to needs no flag of its own."""
+        args_obj = _SentinelArgs(disaggregation_mode="prefill", load_balance_method="follow_bootstrap_room")
+        argv = _render_sentinel(args_obj)
+
+        assert argv == ["--disaggregation-mode", "prefill"]
+        assert _from_parsed_sentinel(_make_sentinel_parser().parse_args(argv)) == args_obj
+
+    def test_an_unrelated_flag_leaves_the_resolved_field_alone(self):
+        """A flag that resolves nothing keeps the first baseline as the fixed point."""
+        assert _render_sentinel(_SentinelArgs(count=2)) == ["--count", "2"]
 
 
 @dataclasses.dataclass
