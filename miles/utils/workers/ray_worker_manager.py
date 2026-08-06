@@ -25,6 +25,7 @@ from miles.utils.workers.worker_spec import (
     LaunchCommandContext,
     NamedHostAndPorts,
     ServeWorkerSpec,
+    WorkerCtorContext,
     WorkerLaunchContext,
     WorkerMetaContext,
 )
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from miles.ray.placement_group import PlacementGroupInfo
+    from miles.utils.workers.backend_capability.base import BackendCapability
 
 # TODO: unique name, maybe with args.run_uuid
 _ACTOR_NAME = "ray_worker_manager"
@@ -379,14 +381,31 @@ def bootstrapped_worker_class(worker_class_path: str) -> type:
 
     class BootstrappedWorker(worker_class):
         def __init__(
-            self, *, ctor_kwargs: Callable[[WorkerLaunchContext], dict[str, Any]], context: WorkerLaunchContext
+            self, *, ctor_kwargs: Callable[[WorkerCtorContext], dict[str, Any]], context: WorkerLaunchContext
         ) -> None:
-            super().__init__(**ctor_kwargs(context))
+            super().__init__(**ctor_kwargs(_ctor_context(context)))
 
     BootstrappedWorker.__name__ = worker_class.__name__
     BootstrappedWorker.__qualname__ = worker_class.__qualname__
     BootstrappedWorker.__module__ = worker_class.__module__
     return BootstrappedWorker
+
+
+def _ctor_context(launch_context: WorkerLaunchContext) -> WorkerCtorContext:
+    from miles.utils.workers.backend_capability.base import DeferredBackendCapability
+
+    return WorkerCtorContext(
+        cell_index=launch_context.cell_index,
+        worker_in_cell_index=launch_context.worker_in_cell_index,
+        gpu_ids=launch_context.gpu_ids,
+        capability=DeferredBackendCapability(create=_create_ray_backend_capability),
+    )
+
+
+def _create_ray_backend_capability() -> BackendCapability:
+    from miles.utils.workers.backend_capability.ray import RayBackendCapability
+
+    return RayBackendCapability(worker_manager_handle=RayWorkerManager.get_handle())
 
 
 async def _gather_or_raise(coros: list[Coroutine[Any, Any, None]]) -> None:
