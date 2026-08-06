@@ -25,8 +25,8 @@ StopWatchFn = Callable[[], Awaitable[None]]
 
 
 class BaseWorkerProvider(abc.ABC):
-    @abc.abstractmethod
-    async def get_addr(self, worker_name: str) -> HostAndPort: ...
+    async def get_addr(self, worker_name: str) -> HostAndPort:
+        return (await self.get_addrs(worker_name=worker_name))["primary"]
 
     @abc.abstractmethod
     async def get_addrs(self, worker_name: str) -> NamedHostAndPorts: ...
