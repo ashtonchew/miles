@@ -20,6 +20,7 @@ from miles.utils.misc import function_registry
 
 PATH_ARGS = ["--rollout-function-path", "--custom-generate-function-path"]
 REQUIRED_ARGS = ["--rollout-batch-size", "64"]
+FULLY_ASYNC_ROLLOUT_FN_PATH = "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
 
 
 def make_class_with_add_arguments():
@@ -285,6 +286,321 @@ class TestSessionServerV2Validation:
             miles_validate_args(args)
 
         assert str(exc_info.value) == (f"--use-session-server v2 does not support {flag}; v2 returns list[Sample]")
+
+
+class TestFullyAsyncLimitValidation:
+    def _parse(self, extra: list[str]) -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        return parser.parse_args([*REQUIRED_ARGS, "--num-rollout", "1", *extra])
+
+    def _parse_fully_async(self, extra: list[str]) -> argparse.Namespace:
+        return self._parse(["--rollout-function-path", FULLY_ASYNC_ROLLOUT_FN_PATH, *extra])
+
+    def test_accepts_boundary_limits_without_mutating_legacy_control(self) -> None:
+        args = self._parse_fully_async(
+            [
+                "--n-samples-per-prompt",
+                "4",
+                "--rollout-batch-size",
+                "2",
+                "--fully-async-max-execution-samples",
+                "4",
+                "--fully-async-max-retained-groups",
+                "2",
+                "--fully-async-max-completed-prefetch-groups",
+                "2",
+            ]
+        )
+
+        miles_validate_args(args)
+
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (4, 2, 2, None)
+
+    def test_rejects_capacity_controls_for_other_rollout_functions(self) -> None:
+        args = self._parse(["--fully-async-max-execution-samples", "64"])
+
+        with pytest.raises(ValueError) as error:
+            miles_validate_args(args)
+
+        assert str(error.value) == (
+            "--fully-async-max-* options require --fully-async or "
+            "--rollout-function-path miles.rollout.fully_async_rollout.FullyAsyncRolloutFn."
+        )
+
+    def test_resolves_conservative_defaults_for_owned_fully_async_mode(self) -> None:
+        args = self._parse(
+            [
+                "--rollout-function-path",
+                FULLY_ASYNC_ROLLOUT_FN_PATH,
+                "--rollout-batch-size",
+                "2",
+                "--n-samples-per-prompt",
+                "4",
+            ]
+        )
+
+        miles_validate_args(args)
+
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (8, 2, 2, None)
+        assert args.data_source_path == "miles.rollout.data_source.RolloutDataSource"
+
+    def test_fully_async_flag_resolves_owned_defaults_and_reservation_source(self) -> None:
+        args = self._parse(
+            [
+                "--fully-async",
+                "--rollout-batch-size",
+                "2",
+                "--n-samples-per-prompt",
+                "4",
+            ]
+        )
+
+        miles_validate_args(args)
+
+        assert (
+            args.rollout_function_path,
+            args.eval_function_path,
+            args.data_source_path,
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+        ) == (
+            FULLY_ASYNC_ROLLOUT_FN_PATH,
+            FULLY_ASYNC_ROLLOUT_FN_PATH,
+            "miles.rollout.data_source.RolloutDataSource",
+            8,
+            2,
+            2,
+        )
+
+    def test_owned_mode_keeps_an_explicit_data_source(self) -> None:
+        args = self._parse(["--fully-async", "--data-source-path", "custom.data.Source"])
+
+        miles_validate_args(args)
+
+        assert args.data_source_path == "custom.data.Source"
+
+    def test_accepts_strict_interior_limits(self) -> None:
+        args = self._parse_fully_async(
+            [
+                "--n-samples-per-prompt",
+                "4",
+                "--rollout-batch-size",
+                "2",
+                "--fully-async-max-execution-samples",
+                "8",
+                "--fully-async-max-retained-groups",
+                "4",
+                "--fully-async-max-completed-prefetch-groups",
+                "3",
+            ]
+        )
+
+        miles_validate_args(args)
+
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (8, 4, 3, None)
+
+    def test_ordinary_mode_keeps_capacity_controls_unset(self) -> None:
+        args = self._parse([])
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (None, None, None, None)
+        assert args.data_source_path == "miles.rollout.data_source.RolloutDataSourceWithBuffer"
+
+        miles_validate_args(args)
+
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (None, None, None, None)
+
+    def test_legacy_only_control_preserves_floor_division_semantics(self) -> None:
+        args = self._parse_fully_async(
+            [
+                "--n-samples-per-prompt",
+                "2",
+                "--async-max-concurrent-samples",
+                "5",
+            ]
+        )
+
+        miles_validate_args(args)
+
+        assert (
+            args.fully_async_max_execution_samples,
+            args.fully_async_max_retained_groups,
+            args.fully_async_max_completed_prefetch_groups,
+            args.async_max_concurrent_samples,
+        ) == (None, None, None, 5)
+        assert args.data_source_path == "miles.rollout.data_source.RolloutDataSourceWithBuffer"
+
+    @pytest.mark.parametrize(
+        ("extra", "expected_error"),
+        [
+            (
+                ["--rollout-batch-size", "0"],
+                "--rollout-batch-size must be a positive integer, got 0.",
+            ),
+            (
+                ["--n-samples-per-prompt", "0"],
+                "--n-samples-per-prompt must be a positive integer, got 0.",
+            ),
+            (
+                ["--fully-async-max-execution-samples", "0"],
+                "--fully-async-max-execution-samples must be a positive integer, got 0.",
+            ),
+            (
+                ["--fully-async-max-retained-groups", "0"],
+                "--fully-async-max-retained-groups must be a positive integer, got 0.",
+            ),
+            (
+                ["--fully-async-max-completed-prefetch-groups", "0"],
+                "--fully-async-max-completed-prefetch-groups must be a positive integer, got 0.",
+            ),
+            (
+                ["--fully-async-max-execution-samples", "-1"],
+                "--fully-async-max-execution-samples must be a positive integer, got -1.",
+            ),
+            (
+                ["--fully-async-max-retained-groups", "-1"],
+                "--fully-async-max-retained-groups must be a positive integer, got -1.",
+            ),
+            (
+                ["--fully-async-max-completed-prefetch-groups", "-1"],
+                "--fully-async-max-completed-prefetch-groups must be a positive integer, got -1.",
+            ),
+        ],
+    )
+    def test_rejects_nonpositive_limits(self, extra: list[str], expected_error: str) -> None:
+        args = self._parse_fully_async(extra)
+
+        with pytest.raises(ValueError) as error:
+            miles_validate_args(args)
+
+        assert str(error.value) == expected_error
+
+    def test_rejects_boolean_limit(self) -> None:
+        args = self._parse_fully_async([])
+        args.fully_async_max_execution_samples = True
+
+        with pytest.raises(ValueError) as error:
+            miles_validate_args(args)
+
+        assert str(error.value) == "--fully-async-max-execution-samples must be a positive integer, got True."
+
+    @pytest.mark.parametrize(
+        ("extra", "expected_error"),
+        [
+            (
+                [
+                    "--n-samples-per-prompt",
+                    "4",
+                    "--fully-async-max-execution-samples",
+                    "2",
+                ],
+                ("--fully-async-max-execution-samples (2) must be at least " "--n-samples-per-prompt (4)."),
+            ),
+            (
+                [
+                    "--n-samples-per-prompt",
+                    "4",
+                    "--fully-async-max-execution-samples",
+                    "5",
+                ],
+                ("--fully-async-max-execution-samples (5) must be divisible by " "--n-samples-per-prompt (4)."),
+            ),
+            (
+                [
+                    "--rollout-batch-size",
+                    "2",
+                    "--fully-async-max-retained-groups",
+                    "1",
+                ],
+                ("--fully-async-max-retained-groups (1) must be at least " "--rollout-batch-size (2)."),
+            ),
+            (
+                [
+                    "--rollout-batch-size",
+                    "2",
+                    "--fully-async-max-retained-groups",
+                    "3",
+                    "--fully-async-max-completed-prefetch-groups",
+                    "1",
+                ],
+                ("--fully-async-max-completed-prefetch-groups (1) must be at least " "--rollout-batch-size (2)."),
+            ),
+            (
+                [
+                    "--rollout-batch-size",
+                    "2",
+                    "--fully-async-max-retained-groups",
+                    "3",
+                    "--fully-async-max-completed-prefetch-groups",
+                    "4",
+                ],
+                (
+                    "--fully-async-max-completed-prefetch-groups (4) must not exceed "
+                    "--fully-async-max-retained-groups (3)."
+                ),
+            ),
+        ],
+    )
+    def test_rejects_invalid_limit_relationships(self, extra: list[str], expected_error: str) -> None:
+        args = self._parse_fully_async(extra)
+
+        with pytest.raises(ValueError) as error:
+            miles_validate_args(args)
+
+        assert str(error.value) == expected_error
+
+    @pytest.mark.parametrize(
+        "new_control",
+        [
+            ["--fully-async-max-execution-samples", "8"],
+            ["--fully-async-max-retained-groups", "4"],
+            ["--fully-async-max-completed-prefetch-groups", "4"],
+        ],
+    )
+    def test_rejects_mixed_control_families(self, new_control: list[str]) -> None:
+        args = self._parse_fully_async(
+            [
+                "--n-samples-per-prompt",
+                "4",
+                "--rollout-batch-size",
+                "2",
+                "--async-max-concurrent-samples",
+                "8",
+                *new_control,
+            ]
+        )
+
+        with pytest.raises(ValueError) as error:
+            miles_validate_args(args)
+
+        assert str(error.value) == (
+            "--async-max-concurrent-samples cannot be combined with fully async capacity controls."
+        )
 
 
 class TestTitoFixedTemplateConfiguration:

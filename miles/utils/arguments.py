@@ -25,6 +25,8 @@ from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
 
+FULLY_ASYNC_ROLLOUT_FN_PATH = "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
+
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
     """The (rollout, eval) function paths the arguments select."""
@@ -650,6 +652,34 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "engine weight version. Groups exceeding this threshold are recycled back to "
                     "the data buffer instead of being sent to training. Only effective in fully "
                     "async mode. None (default) disables staleness filtering."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-max-execution-samples",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of executing samples in fully async mode. "
+                    "The value must contain a whole number of prompt groups. "
+                    "None uses rollout_batch_size * n_samples_per_prompt."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-max-retained-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of source-owned prompt groups retained in fully async mode. "
+                    "None uses rollout_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-max-completed-prefetch-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of completed prompt groups retained before training handoff in fully async mode. "
+                    "None uses rollout_batch_size."
                 ),
             )
             parser.add_argument(
@@ -2731,6 +2761,73 @@ def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
     return list(args.ft_components)
 
 
+def _resolve_fully_async_limits(args: argparse.Namespace) -> None:
+    """Resolve count limits for the ownership-aware fully async scheduler.
+
+    Args:
+        args: Parsed Miles arguments to validate and update.
+
+    Raises:
+        ValueError: If a limit is invalid or both control families are set.
+    """
+    new_limits = (
+        ("--fully-async-max-execution-samples", args.fully_async_max_execution_samples),
+        ("--fully-async-max-retained-groups", args.fully_async_max_retained_groups),
+        ("--fully-async-max-completed-prefetch-groups", args.fully_async_max_completed_prefetch_groups),
+    )
+    if args.async_max_concurrent_samples is not None:
+        raise ValueError("--async-max-concurrent-samples cannot be combined with fully async capacity controls.")
+
+    positive_values = (
+        ("--rollout-batch-size", args.rollout_batch_size),
+        ("--n-samples-per-prompt", args.n_samples_per_prompt),
+        *new_limits,
+    )
+    for option, value in positive_values:
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+            raise ValueError(f"{option} must be a positive integer, got {value!r}.")
+
+    execution_samples = args.fully_async_max_execution_samples
+    if execution_samples is None:
+        execution_samples = args.rollout_batch_size * args.n_samples_per_prompt
+    retained_groups = args.fully_async_max_retained_groups
+    if retained_groups is None:
+        retained_groups = args.rollout_batch_size
+    completed_prefetch_groups = args.fully_async_max_completed_prefetch_groups
+    if completed_prefetch_groups is None:
+        completed_prefetch_groups = args.rollout_batch_size
+
+    if execution_samples < args.n_samples_per_prompt:
+        raise ValueError(
+            f"--fully-async-max-execution-samples ({execution_samples}) must be at least "
+            f"--n-samples-per-prompt ({args.n_samples_per_prompt})."
+        )
+    if execution_samples % args.n_samples_per_prompt != 0:
+        raise ValueError(
+            f"--fully-async-max-execution-samples ({execution_samples}) must be divisible by "
+            f"--n-samples-per-prompt ({args.n_samples_per_prompt})."
+        )
+    if retained_groups < args.rollout_batch_size:
+        raise ValueError(
+            f"--fully-async-max-retained-groups ({retained_groups}) must be at least "
+            f"--rollout-batch-size ({args.rollout_batch_size})."
+        )
+    if completed_prefetch_groups < args.rollout_batch_size:
+        raise ValueError(
+            f"--fully-async-max-completed-prefetch-groups ({completed_prefetch_groups}) must be at least "
+            f"--rollout-batch-size ({args.rollout_batch_size})."
+        )
+    if completed_prefetch_groups > retained_groups:
+        raise ValueError(
+            f"--fully-async-max-completed-prefetch-groups ({completed_prefetch_groups}) must not exceed "
+            f"--fully-async-max-retained-groups ({retained_groups})."
+        )
+
+    args.fully_async_max_execution_samples = execution_samples
+    args.fully_async_max_retained_groups = retained_groups
+    args.fully_async_max_completed_prefetch_groups = completed_prefetch_groups
+
+
 def miles_validate_args(args):
     validate_dashboard_args(args)
 
@@ -3271,6 +3368,25 @@ def miles_validate_args(args):
             f"Streaming optimizer state to disk, dir={args.offload_train_disk_dir}, "
             f"chunk={args.offload_train_disk_chunk_mb}MB, moments={args.stream_optimizer_state_moment_dtype}"
         )
+
+    fully_async_limits_requested = (
+        args.fully_async_max_execution_samples is not None
+        or args.fully_async_max_retained_groups is not None
+        or args.fully_async_max_completed_prefetch_groups is not None
+    )
+    uses_fully_async_rollout = args.fully_async or args.rollout_function_path == FULLY_ASYNC_ROLLOUT_FN_PATH
+    if fully_async_limits_requested and not uses_fully_async_rollout:
+        raise ValueError(
+            f"--fully-async-max-* options require --fully-async or "
+            f"--rollout-function-path {FULLY_ASYNC_ROLLOUT_FN_PATH}."
+        )
+    uses_owned_fully_async_rollout = fully_async_limits_requested or (
+        uses_fully_async_rollout and args.async_max_concurrent_samples is None
+    )
+    if uses_owned_fully_async_rollout:
+        _resolve_fully_async_limits(args)
+        if args.data_source_path == "miles.rollout.data_source.RolloutDataSourceWithBuffer":
+            args.data_source_path = "miles.rollout.data_source.RolloutDataSource"
 
     if args.async_max_concurrent_samples is not None:
         assert args.async_max_concurrent_samples >= args.n_samples_per_prompt, (
