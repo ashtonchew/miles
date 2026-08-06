@@ -35,6 +35,7 @@ from miles.rollout.base_types import (
     RolloutFnInput,
     RolloutFnOutput,
     RolloutFnTrainOutput,
+    TrainAdmissionHold,
     TrainBatchLease,
     TrainBatchRollbackReason,
 )
@@ -93,6 +94,7 @@ class _OwnedExecutionRetry:
 _OwnedTerminalResult = _OwnedCompletedGroup | _OwnedExecutionRetry | _OwnedExecutionFailure
 _OwnedTerminalObserver = Callable[[], Coroutine[object, object, _OwnedTerminalResult]]
 _WorkerResult = LegacyBufferedGroup | _OwnedTerminalResult
+_TrainAdmissionFrontierTask = asyncio.Task[LegacyBufferedGroup] | asyncio.Task[_OwnedTerminalResult]
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,23 @@ class _ActiveOwnedExecution:
 
 BufferSource = list[Sample] | _OwnedCompletedGroup
 BufferEntry = tuple[BufferSource, Group]
+
+
+class _OwnedTrainAdmissionHold(TrainAdmissionHold):
+    def __init__(
+        self,
+        owner: "FullyAsyncRolloutFn",
+        terminal_frontier: tuple[_TrainAdmissionFrontierTask, ...],
+    ) -> None:
+        super().__init__()
+        self._owner = owner
+        self._terminal_frontier = terminal_frontier
+
+    async def _wait_terminal(self) -> None:
+        await self._owner._wait_train_admission_frontier(self)
+
+    def _release(self) -> None:
+        self._owner._release_train_admission_hold(self)
 
 
 class _OwnedTrainBatchLease(TrainBatchLease):
@@ -225,6 +244,7 @@ class DataBuffer:
         self,
         *,
         order: str,
+        blocking_capacity: int,
         max_groups: int | None,
         max_staleness: int | None,
         on_evict: Callable[[BufferSource], None],
@@ -232,7 +252,7 @@ class DataBuffer:
         assert order in ("fifo", "lifo"), f"unknown buffer order: {order}"
         assert max_groups is None or max_groups > 0, f"non-positive buffer capacity: {max_groups}"
         self._order = order
-        self._capacity = max_groups if max_groups is not None else OUTPUT_QUEUE_MAX_GROUPS
+        self._capacity = max_groups if max_groups is not None else blocking_capacity
         self._evict_on_overflow = max_groups is not None
         self._max_staleness = max_staleness
         self._on_evict = on_evict
@@ -412,6 +432,9 @@ class FullyAsyncRolloutFn:
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        self._train_admission_open = asyncio.Event()
+        self._train_admission_open.set()
+        self._train_admission_holds: set[_OwnedTrainAdmissionHold] = set()
         execution_samples = getattr(self.args, "fully_async_max_execution_samples", None)
         retained_groups = getattr(self.args, "fully_async_max_retained_groups", None)
         completed_groups = getattr(self.args, "fully_async_max_completed_prefetch_groups", None)
@@ -458,8 +481,12 @@ class FullyAsyncRolloutFn:
             return await self._call_eval(input)
         if self._worker is None:
             max_batches = self.args.async_data_buffer_max_batches
+            blocking_capacity = (
+                self._completed_groups if self._completed_groups is not None else OUTPUT_QUEUE_MAX_GROUPS
+            )
             self._output = DataBuffer(
                 order=self.args.async_data_buffer_order,
+                blocking_capacity=blocking_capacity,
                 max_groups=max_batches * self.args.rollout_batch_size if max_batches else None,
                 max_staleness=self.args.max_weight_staleness,
                 on_evict=self._recycle_buffer_source,
@@ -472,6 +499,52 @@ class FullyAsyncRolloutFn:
             return await drain_task
         finally:
             self._active_drains.discard(drain_task)
+
+    async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+        """Close source reservation admission and return its owned claim."""
+        if self._closing:
+            raise RuntimeError("Fully async rollout function is closed.")
+        self._train_admission_open.clear()
+        if self._uses_owned_capacity:
+            terminal_frontier: tuple[_TrainAdmissionFrontierTask, ...] = tuple(self._active_executions)
+        else:
+            terminal_frontier = tuple(self._legacy_executions)
+        hold = _OwnedTrainAdmissionHold(self, terminal_frontier)
+        self._train_admission_holds.add(hold)
+        return hold
+
+    async def _wait_train_admission_frontier(self, hold: _OwnedTrainAdmissionHold) -> None:
+        outcomes = await asyncio.gather(
+            *(asyncio.shield(task) for task in hold._terminal_frontier),
+            return_exceptions=True,
+        )
+        worker = self._worker
+        # Owned tasks stay registered through receipt publication or rollback. Legacy
+        # tasks have no receipt, so their terminal frontier ends with the task itself.
+        while (
+            self._worker_error is None
+            and any(task in self._active_executions for task in hold._terminal_frontier)
+            and (worker is None or not worker.done())
+        ):
+            await asyncio.sleep(0)
+        if self._worker_error is not None:
+            raise self._worker_error
+        if worker is not None and worker.done() and not worker.cancelled():
+            worker_error = worker.exception()
+            if worker_error is not None:
+                raise worker_error
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if isinstance(outcome, _OwnedExecutionFailure):
+                raise outcome.error
+
+    def _release_train_admission_hold(self, hold: _OwnedTrainAdmissionHold) -> None:
+        if hold not in self._train_admission_holds:
+            raise RuntimeError("Train admission hold is not active on this rollout function.")
+        self._train_admission_holds.remove(hold)
+        if not self._train_admission_holds and not self._closing:
+            self._train_admission_open.set()
 
     async def close(self) -> None:
         """Stop rollout production and settle every retained reservation.
@@ -504,6 +577,8 @@ class FullyAsyncRolloutFn:
 
     async def _close(self) -> None:
         self._closing = True
+        self._train_admission_holds.clear()
+        self._train_admission_open.clear()
         cleanup_error: BaseException | None = None
         shutdown_error: BaseException | None = None
 
@@ -811,7 +886,7 @@ class FullyAsyncRolloutFn:
         if self._retained_slots is None:
             return False
         await self._retained_slots.acquire()
-        if self._producer_resumed.is_set():
+        if self._producer_resumed.is_set() and self._train_admission_open.is_set():
             return True
         self._retained_slots.release()
         return False
@@ -820,10 +895,16 @@ class FullyAsyncRolloutFn:
         self,
         active: set[asyncio.Task[_WorkerResult]],
     ) -> bool:
-        if self._uses_owned_capacity:
-            retained_slot_acquired = await self._acquire_retained_slot()
-            if not retained_slot_acquired:
-                return False
+        retained_slot_acquired = await self._acquire_retained_slot()
+        if self._uses_owned_capacity and not retained_slot_acquired:
+            return False
+        if not self._producer_resumed.is_set() or not self._train_admission_open.is_set():
+            if retained_slot_acquired:
+                retained_slots = self._retained_slots
+                if retained_slots is None:
+                    raise RuntimeError("Fully async retained capacity is not initialized.")
+                retained_slots.release()
+            return False
         active.add(self._submit_one_group())
         return True
 
@@ -988,36 +1069,40 @@ class FullyAsyncRolloutFn:
             scheduler_blocked = False
             ownership_blocked = False
             self._owned_capacity_released.clear()
-            if fatal_error is None and self._producer_resumed.is_set():
-                while True:
-                    if self._uses_owned_capacity and not self._owned_completed_capacity_available():
-                        ownership_blocked = True
-                        break
-                    if self._uses_owned_capacity and active and not self._owned_retained_capacity_available():
-                        ownership_blocked = True
-                        break
-                    if not self._scheduler.has_capacity(
-                        pending_groups=len(active),
-                        group_budget=self._max_in_flight_groups(),
-                    ):
-                        scheduler_blocked = True
-                        break
-                    try:
-                        submitted = await self._submit_active_group(active)
-                    except Exception as submission_error:
-                        if not self._uses_owned_capacity:
-                            self._record_worker_error(submission_error)
-                            raise
-                        fatal_error = self._record_worker_error(submission_error)
-                        break
-                    if not submitted:
-                        break
-                    if self._uses_owned_capacity:
-                        # Let terminal work claim reopened prefetch capacity before
-                        # another reservation is admitted.
-                        await asyncio.sleep(0)
-                        if any(task.done() for task in active):
+            if fatal_error is None:
+                if not active:
+                    await self._producer_resumed.wait()
+                    await self._train_admission_open.wait()
+                if self._producer_resumed.is_set() and self._train_admission_open.is_set():
+                    while True:
+                        if self._uses_owned_capacity and not self._owned_completed_capacity_available():
+                            ownership_blocked = True
                             break
+                        if self._uses_owned_capacity and active and not self._owned_retained_capacity_available():
+                            ownership_blocked = True
+                            break
+                        if not self._scheduler.has_capacity(
+                            pending_groups=len(active),
+                            group_budget=self._max_in_flight_groups(),
+                        ):
+                            scheduler_blocked = True
+                            break
+                        try:
+                            submitted = await self._submit_active_group(active)
+                        except Exception as submission_error:
+                            if not self._uses_owned_capacity:
+                                self._record_worker_error(submission_error)
+                                raise
+                            fatal_error = self._record_worker_error(submission_error)
+                            break
+                        if not submitted:
+                            break
+                        if self._uses_owned_capacity:
+                            # Let terminal work claim reopened prefetch capacity before
+                            # another reservation is admitted.
+                            await asyncio.sleep(0)
+                            if any(task.done() for task in active):
+                                break
             if fatal_error is not None:
                 queued_settlement_error = await self._rollback_queued_owned_groups(output)
                 if fatal_settlement_error is None:
@@ -1055,24 +1140,40 @@ class FullyAsyncRolloutFn:
                 if not self._producer_resumed.is_set():
                     await self._producer_resumed.wait()
                     continue
+                if not self._train_admission_open.is_set():
+                    await self._train_admission_open.wait()
+                    continue
                 raise RuntimeError("Fully async scheduler has admission capacity but no active work.")
             if fatal_error is None and self._producer_resumed.is_set():
-                if ownership_blocked:
-                    capacity_waiter = asyncio.create_task(self._owned_capacity_released.wait())
+                if self._train_admission_open.is_set():
+                    if ownership_blocked:
+                        capacity_waiter = asyncio.create_task(self._owned_capacity_released.wait())
+                        try:
+                            ready, _ = await asyncio.wait(
+                                [*active, capacity_waiter],
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            capacity_waiter.cancel()
+                            await asyncio.gather(capacity_waiter, return_exceptions=True)
+                        done = active.intersection(ready)
+                        active.difference_update(done)
+                    elif scheduler_blocked:
+                        done, active = await self._scheduler.wait_for_progress(active)
+                    else:
+                        done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    admission_waiter = asyncio.create_task(self._train_admission_open.wait())
                     try:
                         ready, _ = await asyncio.wait(
-                            [*active, capacity_waiter],
+                            [*active, admission_waiter],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     finally:
-                        capacity_waiter.cancel()
-                        await asyncio.gather(capacity_waiter, return_exceptions=True)
+                        admission_waiter.cancel()
+                        await asyncio.gather(admission_waiter, return_exceptions=True)
                     done = active.intersection(ready)
                     active.difference_update(done)
-                elif scheduler_blocked:
-                    done, active = await self._scheduler.wait_for_progress(active)
-                else:
-                    done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             else:
                 done, active = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             if not done:

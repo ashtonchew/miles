@@ -9,9 +9,22 @@ import pytest
 from miles.rollout.base_types import (
     LeasedRolloutFnTrainOutput,
     RolloutFnTrainOutput,
+    TrainAdmissionHold,
     TrainBatchLease,
     TrainBatchRollbackReason,
 )
+
+
+class RecordingTrainAdmissionHold(TrainAdmissionHold):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    async def _wait_terminal(self) -> None:
+        self._events.append("terminal")
+
+    def _release(self) -> None:
+        self._events.append("release")
 
 
 class RecordingTrainBatchLease(TrainBatchLease):
@@ -30,6 +43,22 @@ class RecordingTrainBatchLease(TrainBatchLease):
 
     def _rollback(self, reason: TrainBatchRollbackReason) -> None:
         self._on_rollback(reason)
+
+
+async def test_train_admission_hold_releases_once() -> None:
+    events: list[str] = []
+    hold = RecordingTrainAdmissionHold(events)
+
+    hold.release()
+
+    assert events == ["release"]
+    with pytest.raises(RuntimeError) as wait_after_release:
+        await hold.wait_terminal()
+    assert str(wait_after_release.value) == "Train admission hold already has a release attempt."
+    with pytest.raises(RuntimeError) as repeated_release:
+        hold.release()
+    assert str(repeated_release.value) == "Train admission hold already has a release attempt."
+    assert events == ["release"]
 
 
 def test_leased_output_preserves_the_ordinary_train_output_contract() -> None:

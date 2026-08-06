@@ -321,6 +321,7 @@ async def test_terminal_failure_requeues_exact_source_reservation(monkeypatch):
 async def test_mismatched_execution_receipt_retains_ownership_fail_closed(monkeypatch):
     reservation = make_reservation(50)
     data_source = FakeReservationDataSource([reservation])
+    release_terminal = asyncio.Event()
 
     class MismatchedReceiptExecution:
         def __init__(self, executor_receipt: ReservationExecutorReceipt) -> None:
@@ -331,6 +332,7 @@ async def test_mismatched_execution_receipt_retains_ownership_fail_closed(monkey
             self.cancellation_requests += 1
 
         async def wait_terminal(self) -> FullyAsyncExecutionSuccess:
+            await release_terminal.wait()
             return FullyAsyncExecutionSuccess(
                 executor_receipt=replace(self.executor_receipt),
                 samples=[deepcopy(sample) for sample in reservation.samples],
@@ -351,9 +353,17 @@ async def test_mismatched_execution_receipt_retains_ownership_fail_closed(monkey
 
     monkeypatch.setattr(fn._executor, "submit", submit)
 
-    with pytest.raises(RuntimeError) as train_error:
-        await fn(RolloutFnTrainInput(rollout_id=50))
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=50)))
+    await wait_until(lambda: len(executions) == 1)
+    hold = await fn.acquire_train_admission_hold()
+    release_terminal.set()
 
+    with pytest.raises(RuntimeError) as terminal_error:
+        await asyncio.wait_for(hold.wait_terminal(), timeout=1)
+    with pytest.raises(RuntimeError) as train_error:
+        await train
+
+    assert terminal_error.value is train_error.value
     assert str(train_error.value) == "Execution receipt 0 did not return its exact terminal receipt."
     assert data_source.reserved == [reservation]
     assert data_source.acknowledged == []
@@ -841,6 +851,7 @@ async def test_legacy_claimed_group_survives_output_queue_refill(monkeypatch):
     fn = make_fn(monkeypatch, make_args(), FakeDataSource())
     output = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=None,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -883,6 +894,7 @@ async def test_worker_failure_wins_when_output_queue_completes_in_the_same_wait(
     completed_slots.get_nowait()
     output = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=None,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -1056,6 +1068,7 @@ async def test_close_recycles_unconsumed_legacy_active_and_prefetched_groups(mon
     )
     output = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=None,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -1081,11 +1094,11 @@ async def test_close_recycles_legacy_group_blocked_on_output_put(monkeypatch):
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
     output = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=1,
         max_groups=None,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
     )
-    output._capacity = 1
     await output.put((prefetched_group, prefetched_group))
     fn._output = output
     fn._worker = asyncio.create_task(fn._worker_loop())
@@ -1153,6 +1166,7 @@ async def test_close_retries_failed_legacy_recycle(monkeypatch):
     fn = make_fn(monkeypatch, make_args(rollout_batch_size=1), data_source)
     output = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=None,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -1713,6 +1727,660 @@ async def test_owned_execution_capacity_bounds_started_source_samples(monkeypatc
     output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
 
 
+async def test_train_admission_hold_blocks_new_source_reservations_until_release(monkeypatch):
+    reservation = make_reservation(54)
+    data_source = FakeReservationDataSource([reservation])
+    fn = make_owned_fn(monkeypatch, data_source)
+
+    hold = await fn.acquire_train_admission_hold()
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=54)))
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert (data_source.reserved, train.done()) == ([], False)
+
+    hold.release()
+    output = await asyncio.wait_for(train, timeout=1)
+
+    assert output.samples == [list(reservation.samples)]
+
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_overlapping_train_admission_holds_reopen_only_after_exact_releases(monkeypatch):
+    reservation = make_reservation(57)
+    data_source = FakeReservationDataSource([reservation])
+    fn = make_owned_fn(monkeypatch, data_source)
+
+    first_hold = await fn.acquire_train_admission_hold()
+    second_hold = await fn.acquire_train_admission_hold()
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=57)))
+
+    first_hold.release()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert (data_source.reserved, train.done()) == ([], False)
+
+    second_hold.release()
+    output = await asyncio.wait_for(train, timeout=1)
+
+    assert output.samples == [list(reservation.samples)]
+
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_train_admission_hold_waits_for_its_terminal_frontier_without_issuing_a_lease(monkeypatch):
+    reservations = [make_reservation(55), make_reservation(56)]
+    data_source = FakeReservationDataSource(reservations)
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        generation_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        retained_groups=2,
+        completed_groups=2,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=55)))
+    await generation_started.wait()
+
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert (terminal.done(), data_source.reserved) == (False, reservations[:1])
+
+    release_generation.set()
+    await terminal
+    output = await train
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert output.samples == [list(reservations[0].samples)]
+    assert data_source.reserved == reservations[:1]
+
+    hold.release()
+    await wait_until(lambda: data_source.reserved == reservations)
+
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_train_admission_hold_does_not_consume_sample_wakes_while_ownership_blocks(monkeypatch):
+    reservation = make_reservation(81)
+    data_source = FakeReservationDataSource([reservation])
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    callbacks = []
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        callbacks.append(sample_done_callback)
+        generation_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        rollout_submission_granularity=None,
+    )
+    progress_waits = 0
+    wait_for_progress = fn._scheduler.wait_for_progress
+
+    async def count_progress_waits(pendings):
+        nonlocal progress_waits
+        progress_waits += 1
+        return await wait_for_progress(pendings)
+
+    fn._scheduler.wait_for_progress = count_progress_waits
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=81)))
+    await generation_started.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert progress_waits == 0
+
+    hold = await fn.acquire_train_admission_hold()
+
+    try:
+        assert callbacks[0] is not None
+        callbacks[0]()
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        assert progress_waits == 0
+    finally:
+        hold.release()
+        release_generation.set()
+
+    output = await asyncio.wait_for(train, timeout=1)
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_train_admission_hold_settles_terminal_frontier_with_a_full_owned_buffer(monkeypatch):
+    monkeypatch.setattr(fully_async, "OUTPUT_QUEUE_MAX_GROUPS", 1)
+    reservations = [make_reservation(79), make_reservation(80)]
+    data_source = FakeReservationDataSource(reservations)
+    all_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    started = 0
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        nonlocal started
+        started += 1
+        if started == len(reservations):
+            all_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        execution_samples=4,
+        retained_groups=2,
+        completed_groups=2,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=79)))
+    await all_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    train.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await train
+
+    release_generation.set()
+    try:
+        await asyncio.wait_for(hold.wait_terminal(), timeout=0.1)
+        assert fn._output is not None
+        assert fn._output.qsize() == 2
+        assert fn._active_executions == {}
+    finally:
+        await fn.close()
+
+    assert sorted(data_source.requeued, key=lambda batch: str(batch[0].reservation_id)) == [
+        [reservations[0]],
+        [reservations[1]],
+    ]
+
+
+async def test_train_admission_hold_preserves_legacy_frontier_compatibility(monkeypatch):
+    data_source = FakeDataSource()
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        generation_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=1),
+        data_source,
+        generate=generate,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=67)))
+    await generation_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+    await asyncio.sleep(0)
+
+    assert (terminal.done(), data_source.num_get_calls) == (False, 1)
+
+    release_generation.set()
+    await terminal
+    output = await train
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert output.samples == [make_group(1001)]
+    assert data_source.num_get_calls == 1
+
+    hold.release()
+    await wait_until(lambda: data_source.num_get_calls == 2)
+    await fn.close()
+
+
+async def test_legacy_admission_hold_does_not_wait_for_saturated_buffer_publication(monkeypatch):
+    monkeypatch.setattr(fully_async, "OUTPUT_QUEUE_MAX_GROUPS", 1)
+    data_source = FakeDataSource()
+    started: list[int] = []
+    generation_releases = {
+        1001: asyncio.Event(),
+        1002: asyncio.Event(),
+    }
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        started.append(group_index)
+        await generation_releases[group_index].wait()
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            async_max_concurrent_samples=2 * N_SAMPLES_PER_PROMPT,
+            rollout_submission_granularity="group",
+        ),
+        data_source,
+        generate=generate,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=68)))
+    await wait_until(lambda: started == [1001, 1002])
+    train.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await train
+
+    assert fn._output is not None
+    prefilled_group = make_group(90)
+    await fn._output.put((prefilled_group, prefilled_group))
+    generation_releases[1001].set()
+    await wait_until(
+        lambda: len(fn._legacy_executions) == 1 and next(iter(fn._legacy_executions.values()))[0].group_index == 1002
+    )
+
+    hold = await fn.acquire_train_admission_hold()
+    generation_releases[1002].set()
+    try:
+        await asyncio.wait_for(hold.wait_terminal(), timeout=0.1)
+
+        assert fn._output.qsize() == 1
+        assert len(fn._legacy_executions) == 1
+        assert next(iter(fn._legacy_executions)).done()
+
+        published_groups = [(await fn._output.get())[1]]
+        for _ in range(2):
+            await wait_until(lambda: fn._output.qsize() == 1)
+            published_groups.append((await fn._output.get())[1])
+
+        assert [[sample.group_index for sample in group] for group in published_groups] == [
+            [90, 90],
+            [1001, 1001],
+            [1002, 1002],
+        ]
+    finally:
+        hold.release()
+        await fn.close()
+
+
+async def test_legacy_terminal_frontier_reports_the_canonical_worker_failure(monkeypatch):
+    first_group = make_group(72)
+    second_group = make_group(73)
+    data_source = FakeDataSource(scripted=[first_group, second_group])
+    all_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    started: list[int] = []
+    first_failure = RuntimeError("first captured legacy execution failed")
+    canonical_failure = RuntimeError("second captured legacy execution failed first")
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        started.append(group_index)
+        if len(started) == 2:
+            all_started.set()
+        await all_started.wait()
+        if group_index == 72:
+            try:
+                await release_first.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                await release_first.wait()
+            raise first_failure
+        await release_second.wait()
+        raise canonical_failure
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=2),
+        data_source,
+        generate=generate,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=72)))
+    await all_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+
+    release_second.set()
+    await first_cancelled.wait()
+    release_first.set()
+
+    with pytest.raises(RuntimeError) as terminal_error:
+        await terminal
+    with pytest.raises(RuntimeError) as train_error:
+        await train
+
+    assert terminal_error.value is canonical_failure
+    assert train_error.value is canonical_failure
+
+    with pytest.raises(RuntimeError) as close_error:
+        await fn.close()
+    assert close_error.value is canonical_failure
+    await fn.close()
+
+
+async def test_train_admission_hold_fences_retained_capacity_waiter(monkeypatch):
+    reservations = [make_reservation(58), make_reservation(59)]
+    data_source = FakeReservationDataSource(reservations)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        retained_groups=1,
+        completed_groups=2,
+    )
+    output = await fn(RolloutFnTrainInput(rollout_id=58))
+
+    hold = await fn.acquire_train_admission_hold()
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert data_source.reserved == reservations[:1]
+
+    hold.release()
+    await wait_until(lambda: data_source.reserved == reservations)
+    await fn.close()
+
+
+async def test_cancelled_terminal_wait_preserves_the_hold_and_frontier(monkeypatch):
+    reservation = make_reservation(60)
+    data_source = FakeReservationDataSource([reservation])
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        generation_started.set()
+        await release_generation.wait()
+        return group
+
+    fn = make_owned_fn(monkeypatch, data_source, generate)
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=60)))
+    await generation_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+
+    cancelled_wait = asyncio.create_task(hold.wait_terminal())
+    await asyncio.sleep(0)
+    cancelled_wait.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_wait
+
+    retry_wait = asyncio.create_task(hold.wait_terminal())
+    await asyncio.sleep(0)
+
+    assert (retry_wait.done(), data_source.requeued) == (False, [])
+
+    release_generation.set()
+    await retry_wait
+    output = await train
+
+    assert output.samples == [list(reservation.samples)]
+
+    hold.release()
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_train_admission_hold_allows_staggered_frontier_processing(monkeypatch):
+    reservations = [make_reservation(68), make_reservation(69)]
+    data_source = FakeReservationDataSource(reservations)
+    all_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    started: list[int] = []
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        started.append(group_index)
+        if len(started) == 2:
+            all_started.set()
+        await all_started.wait()
+        await (release_first if group_index == 68 else release_second).wait()
+        return group
+
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        batch_size=2,
+        execution_samples=4,
+        retained_groups=2,
+        completed_groups=2,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=68)))
+    await all_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+
+    release_first.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert terminal.done() is False
+
+    release_second.set()
+    await asyncio.wait_for(terminal, timeout=1)
+    output = await asyncio.wait_for(train, timeout=1)
+
+    assert output.samples == [list(reservations[0].samples), list(reservations[1].samples)]
+
+    hold.release()
+    output.lease.rollback(TrainBatchRollbackReason.HANDOFF_FAILED)
+    await fn.close()
+
+
+async def test_terminal_frontier_failure_waits_for_siblings_and_keeps_admission_held(monkeypatch):
+    reservations = [make_reservation(61), make_reservation(62)]
+    data_source = FakeReservationDataSource(reservations)
+    all_started = asyncio.Event()
+    release_failure = asyncio.Event()
+    release_sibling = asyncio.Event()
+    started: list[int] = []
+    failure = RuntimeError("frontier execution failed")
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        started.append(group_index)
+        if len(started) == 2:
+            all_started.set()
+        await all_started.wait()
+        if group_index == 61:
+            await release_failure.wait()
+            raise failure
+        try:
+            await release_sibling.wait()
+        except asyncio.CancelledError:
+            await release_sibling.wait()
+        return group
+
+    async def request_abort(args) -> None:
+        pass
+
+    monkeypatch.setattr(inference_fully_async, "request_abort", request_abort)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        batch_size=2,
+        execution_samples=4,
+        retained_groups=2,
+        completed_groups=2,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=61)))
+    await all_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+
+    release_failure.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert terminal.done() is False
+
+    release_sibling.set()
+    with pytest.raises(RuntimeError) as terminal_error:
+        await terminal
+    with pytest.raises(RuntimeError) as train_error:
+        await train
+    await wait_until(lambda: sum(len(batch) for batch in data_source.requeued) == 2)
+
+    assert terminal_error.value is failure
+    assert train_error.value is failure
+    assert (
+        sorted(
+            (reservation for batch in data_source.requeued for reservation in batch),
+            key=lambda reservation: reservation.reservation_id,
+        )
+        == reservations
+    )
+
+    with pytest.raises(RuntimeError) as close_error:
+        await fn.close()
+    assert close_error.value is failure
+    await fn.close()
+
+
+async def test_terminal_frontier_reports_the_canonical_worker_failure(monkeypatch):
+    reservations = [make_reservation(70), make_reservation(71)]
+    data_source = FakeReservationDataSource(reservations)
+    all_started = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    abort_requested = asyncio.Event()
+    started: list[int] = []
+    first_failure = RuntimeError("first captured execution failed")
+    canonical_failure = RuntimeError("second captured execution failed first")
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        group_index = group[0].group_index
+        started.append(group_index)
+        if len(started) == 2:
+            all_started.set()
+        await all_started.wait()
+        await (release_first if group_index == 70 else release_second).wait()
+        if group_index == 70:
+            raise first_failure
+        raise canonical_failure
+
+    async def request_abort(args) -> None:
+        abort_requested.set()
+
+    monkeypatch.setattr(inference_fully_async, "request_abort", request_abort)
+    fn = make_owned_fn(
+        monkeypatch,
+        data_source,
+        generate,
+        batch_size=2,
+        execution_samples=4,
+        retained_groups=2,
+        completed_groups=2,
+    )
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=70)))
+    await all_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    terminal = asyncio.create_task(hold.wait_terminal())
+
+    release_second.set()
+    await abort_requested.wait()
+    release_first.set()
+
+    with pytest.raises(RuntimeError) as terminal_error:
+        await terminal
+    with pytest.raises(RuntimeError) as train_error:
+        await train
+
+    assert terminal_error.value is canonical_failure
+    assert train_error.value is canonical_failure
+
+    with pytest.raises(RuntimeError) as close_error:
+        await fn.close()
+    assert close_error.value is canonical_failure
+    await fn.close()
+
+
+async def test_train_admission_hold_preserves_a_prior_worker_failure(monkeypatch):
+    reservation = make_reservation(64)
+    data_source = FakeReservationDataSource([reservation])
+    failure = RuntimeError("worker failed before hold acquisition")
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        raise failure
+
+    fn = make_owned_fn(monkeypatch, data_source, generate)
+    with pytest.raises(RuntimeError) as train_error:
+        await fn(RolloutFnTrainInput(rollout_id=64))
+
+    hold = await fn.acquire_train_admission_hold()
+    with pytest.raises(RuntimeError) as terminal_error:
+        await hold.wait_terminal()
+
+    assert train_error.value is failure
+    assert terminal_error.value is failure
+
+    with pytest.raises(RuntimeError) as close_error:
+        await fn.close()
+    assert close_error.value is failure
+    await fn.close()
+
+
+async def test_close_dominates_an_active_train_admission_hold(monkeypatch):
+    reservation = make_reservation(63)
+    data_source = FakeReservationDataSource([reservation])
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+    abort_requested = asyncio.Event()
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        generation_started.set()
+        try:
+            await release_generation.wait()
+        except asyncio.CancelledError:
+            await release_generation.wait()
+        return group
+
+    async def request_abort(args) -> None:
+        abort_requested.set()
+
+    monkeypatch.setattr(inference_fully_async, "request_abort", request_abort)
+    fn = make_owned_fn(monkeypatch, data_source, generate)
+    train = asyncio.create_task(fn(RolloutFnTrainInput(rollout_id=63)))
+    await generation_started.wait()
+    hold = await fn.acquire_train_admission_hold()
+    close = asyncio.create_task(fn.close())
+    await abort_requested.wait()
+    terminal = asyncio.create_task(hold.wait_terminal())
+    await asyncio.sleep(0)
+
+    assert (terminal.done(), close.done()) == (False, False)
+
+    release_generation.set()
+    await terminal
+    await close
+    with pytest.raises(asyncio.CancelledError):
+        await train
+
+    assert data_source.requeued == [[reservation]]
+    with pytest.raises(RuntimeError) as release_error:
+        hold.release()
+    assert str(release_error.value) == "Train admission hold is not active on this rollout function."
+    with pytest.raises(RuntimeError) as acquisition_error:
+        await fn.acquire_train_admission_hold()
+    assert str(acquisition_error.value) == "Fully async rollout function is closed."
+
+
 async def test_owned_retained_limit_does_not_block_active_completion(monkeypatch):
     reservation = make_reservation(32)
     data_source = FakeReservationDataSource([reservation])
@@ -1954,6 +2622,7 @@ async def test_owned_buffer_eviction_requeues_exact_source_reservation(monkeypat
     )
     buffer = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=1,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -2464,7 +3133,13 @@ async def test_group_granularity_opts_the_worker_out_of_backfill(monkeypatch):
 
 def make_buffer(**overrides):
     evicted = []
-    defaults = dict(order="fifo", max_groups=None, max_staleness=None, on_evict=evicted.append)
+    defaults = dict(
+        order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
+        max_groups=None,
+        max_staleness=None,
+        on_evict=evicted.append,
+    )
     defaults.update(overrides)
     return fully_async.DataBuffer(**defaults), evicted
 
@@ -2493,6 +3168,7 @@ async def test_buffer_eviction_recycles_the_original_prompt_group(monkeypatch):
     fn = make_fn(monkeypatch, make_args(), data_source)
     buffer = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=1,
         max_staleness=None,
         on_evict=fn._recycle_buffer_source,
@@ -2563,6 +3239,7 @@ async def test_buffer_failed_eviction_returns_incoming_group_to_caller():
 
     buffer = fully_async.DataBuffer(
         order="fifo",
+        blocking_capacity=fully_async.OUTPUT_QUEUE_MAX_GROUPS,
         max_groups=1,
         max_staleness=2,
         on_evict=settle,

@@ -54,6 +54,54 @@ class TrainBatchRollbackReason(Enum):
     HANDOFF_FAILED = auto()
 
 
+class TrainAdmissionHold(ABC):
+    """Own one claim that keeps new rollout source admission closed.
+
+    Active holds block new source reservations. Admission remains closed until
+    every active hold is released or the rollout lifecycle begins closing.
+    """
+
+    def __init__(self) -> None:
+        self._release_attempted = False
+
+    async def wait_terminal(self) -> None:
+        """Wait until every execution before this hold's frontier is terminal.
+
+        This does not consume completed groups, settle train-batch leases, or
+        request execution cancellation. Calls may be repeated while the hold
+        remains unreleased, including after lifecycle close begins.
+
+        Raises:
+            RuntimeError: If release was already attempted.
+            BaseException: A terminal execution or lifecycle failure.
+        """
+        if self._release_attempted:
+            raise RuntimeError("Train admission hold already has a release attempt.")
+        await self._wait_terminal()
+
+    @abstractmethod
+    async def _wait_terminal(self) -> None:
+        """Implement terminal observation for this hold's admission frontier."""
+
+    def release(self) -> None:
+        """Release this hold's claim on source admission.
+
+        A release attempt claims the handle even if its implementation raises.
+        Source reservation reopens only after every active hold is released.
+
+        Raises:
+            RuntimeError: If release was already attempted.
+        """
+        if self._release_attempted:
+            raise RuntimeError("Train admission hold already has a release attempt.")
+        self._release_attempted = True
+        self._release()
+
+    @abstractmethod
+    def _release(self) -> None:
+        """Implement release of this exact admission claim."""
+
+
 class TrainBatchLease(ABC):
     """Own a rollout batch until its train-data handoff settles.
 
