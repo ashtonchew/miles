@@ -73,6 +73,7 @@ def make_manager(args, eval_fn=None, fleet=None):
     mgr.eval_generate_rollout = eval_fn
     mgr._eval_fleet = fleet
     args.eval_uses_snapshots = eval_fn is not None and (fleet is not None or isinstance(eval_fn, CheckpointEvalFn))
+    mgr._train_rollout_lifecycle = None
     return mgr
 
 

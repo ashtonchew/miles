@@ -15,6 +15,7 @@ import asyncio
 import textwrap
 import threading
 import time
+from contextlib import nullcontext
 
 import pytest
 import ray
@@ -924,6 +925,203 @@ class TestRolloutLifecycle:
         assert str(duplicate_release.value) == f"Unknown train admission hold {hold_id}."
         assert events == ["acquire:0", "release:0"]
         assert lifecycle.active_holds == set()
+
+    async def test_shared_eval_holds_train_admission_without_waiting_terminal(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append(f"eval:{input.rollout_id}")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+
+        await manager.eval(rollout_id=19)
+
+        assert events == ["acquire:0", "eval:19", "release:0"]
+
+    async def test_cancelled_legacy_shared_eval_returns_before_worker_finishes(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        eval_started = threading.Event()
+        finish_eval = threading.Event()
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval_started")
+            eval_started.set()
+            assert finish_eval.wait(timeout=5)
+            events.append("eval_finished")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+        eval_task = asyncio.create_task(manager.eval(rollout_id=25))
+        assert await asyncio.to_thread(eval_started.wait, 5)
+
+        try:
+            eval_task.cancel()
+            done, pending = await asyncio.wait({eval_task}, timeout=0.5)
+
+            assert done == {eval_task}
+            assert pending == set()
+            with pytest.raises(asyncio.CancelledError):
+                await eval_task
+            assert events == ["eval_started"]
+        finally:
+            finish_eval.set()
+            await asyncio.gather(eval_task, return_exceptions=True)
+
+    async def test_checkpoint_eval_does_not_acquire_train_admission_hold(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        _install_train_rollout_lifecycle(manager, RecordingRolloutLifecycle(events))
+        manager.args.eval_uses_snapshots = True
+
+        async def checkpoint_eval(
+            rollout_id: int,
+            hf_dir: str | None,
+            export_time_seconds: float | None,
+            require_marker: bool,
+        ) -> str:
+            events.append(f"checkpoint_eval:{rollout_id}")
+            return "checkpoint-result"
+
+        manager._eval_checkpoint = checkpoint_eval
+
+        result = await manager.eval(rollout_id=23, hf_dir="/snapshot")
+
+        assert result == "checkpoint-result"
+        assert events == ["checkpoint_eval:23"]
+
+    async def test_shared_eval_preserves_failure_when_exact_release_also_fails(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        eval_failure = RuntimeError("shared eval failed")
+        release_failure = RuntimeError("hold release failed")
+
+        class FailingReleaseHold(TrainAdmissionHold):
+            async def _wait_terminal(self) -> None:
+                raise AssertionError("shared eval must not wait for terminal work")
+
+            def _release(self) -> None:
+                events.append("release")
+                raise release_failure
+
+        class FailingReleaseLifecycle(RecordingRolloutLifecycle):
+            async def acquire_train_admission_hold(self) -> TrainAdmissionHold:
+                events.append("acquire")
+                return FailingReleaseHold()
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval")
+            raise eval_failure
+
+        _install_train_rollout_lifecycle(manager, FailingReleaseLifecycle(events))
+        manager.eval_generate_rollout = evaluate
+
+        with pytest.raises(RuntimeError) as error:
+            await manager.eval(rollout_id=24)
+
+        assert error.value is eval_failure
+        assert error.value.__cause__ is release_failure
+        assert events == ["acquire", "eval", "release"]
+
+    async def test_overlapping_shared_evals_release_only_their_exact_holds(
+        self,
+        lifecycle_manager,
+        monkeypatch,
+    ):
+        import miles.ray.rollout.rollout_manager as rmgr
+
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        monkeypatch.setattr(rmgr, "timer", lambda name: nullcontext())
+        started = {20: threading.Event(), 21: threading.Event()}
+        finish = {20: threading.Event(), 21: threading.Event()}
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append(f"eval_started:{input.rollout_id}")
+            started[input.rollout_id].set()
+            assert finish[input.rollout_id].wait(timeout=5)
+            events.append(f"eval_finished:{input.rollout_id}")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+        first_eval = asyncio.create_task(manager.eval(rollout_id=20))
+        assert await asyncio.to_thread(started[20].wait, 5)
+        second_eval = asyncio.create_task(manager.eval(rollout_id=21))
+        assert await asyncio.to_thread(started[21].wait, 5)
+
+        finish[20].set()
+        await first_eval
+
+        assert lifecycle.active_holds == {1}
+        assert second_eval.done() is False
+
+        finish[21].set()
+        await second_eval
+
+        assert lifecycle.active_holds == set()
+        assert events == [
+            "acquire:0",
+            "eval_started:20",
+            "acquire:1",
+            "eval_started:21",
+            "eval_finished:20",
+            "release:0",
+            "eval_finished:21",
+            "release:1",
+        ]
+
+    async def test_cancelled_shared_eval_keeps_hold_until_invocation_settles(self, lifecycle_manager):
+        manager = lifecycle_manager
+        manager.args.debug_train_only = False
+        events: list[str] = []
+        lifecycle = RecordingRolloutLifecycle(events)
+        _install_train_rollout_lifecycle(manager, lifecycle)
+        eval_started = threading.Event()
+        finish_eval = threading.Event()
+
+        def evaluate(input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+            events.append("eval_started")
+            eval_started.set()
+            assert finish_eval.wait(timeout=5)
+            events.append("eval_finished")
+            return RolloutFnEvalOutput(data={}, metrics=None)
+
+        manager.eval_generate_rollout = evaluate
+        eval_task = asyncio.create_task(manager.eval(rollout_id=22))
+        assert await asyncio.to_thread(eval_started.wait, 5)
+
+        eval_task.cancel()
+
+        async def wait_for_release() -> None:
+            while lifecycle.active_holds:
+                await asyncio.sleep(0)
+
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(wait_for_release(), timeout=0.1)
+            assert eval_task.done() is False
+            assert lifecycle.active_holds == {0}
+            assert events == ["acquire:0", "eval_started"]
+        finally:
+            finish_eval.set()
+            await asyncio.gather(eval_task, return_exceptions=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await eval_task
+
+        assert lifecycle.active_holds == set()
+        assert events == ["acquire:0", "eval_started", "eval_finished", "release:0"]
 
     async def test_dispose_closes_unique_rollout_lifecycles_before_manager_resources(
         self,

@@ -440,20 +440,42 @@ class RolloutManager:
         if self.args.eval_uses_snapshots:
             return await self._eval_checkpoint(rollout_id, hf_dir, export_time_seconds, require_marker)
 
-        with timer("eval_rollout"):
-            if self.use_experimental_refactor:
-                result = await asyncio.to_thread(
-                    call_rollout_function, self.eval_generate_rollout, RolloutFnEvalInput(rollout_id=rollout_id)
-                )
-            else:
-                result = await asyncio.to_thread(
-                    call_rollout_fn,
-                    self.eval_generate_rollout,
-                    self.args,
-                    rollout_id,
-                    self.data_source,
-                    evaluation=True,
-                )
+        hold_id = await self.acquire_train_admission_hold()
+        try:
+            with timer("eval_rollout"):
+                if self.use_experimental_refactor:
+                    eval_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            call_rollout_function,
+                            self.eval_generate_rollout,
+                            RolloutFnEvalInput(rollout_id=rollout_id),
+                        )
+                    )
+                else:
+                    eval_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            call_rollout_fn,
+                            self.eval_generate_rollout,
+                            self.args,
+                            rollout_id,
+                            self.data_source,
+                            evaluation=True,
+                        )
+                    )
+                if hold_id is None:
+                    result = await eval_task
+                else:
+                    result = await _await_task_before_cancellation(eval_task)
+        except BaseException as eval_error:
+            if hold_id is not None:
+                try:
+                    await self.release_train_admission_hold(hold_id)
+                except BaseException as release_error:
+                    raise eval_error from release_error
+            raise
+        else:
+            if hold_id is not None:
+                await self.release_train_admission_hold(hold_id)
         data = result.data
         save_debug_rollout_data(self.args, data, rollout_id=rollout_id, evaluation=True)
         metrics = log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
