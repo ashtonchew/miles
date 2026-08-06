@@ -129,6 +129,8 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
     return ans
 
 
+# TODO: the driver assembly below has nothing to do with placement groups; move it out when the
+# files are reorganized
 async def create_training_models(
     args,
     rollout_executor: BaseWorkerHandle,
