@@ -1,0 +1,10 @@
+{
+  "miles/miles/utils/distributed_utils.py": {
+    "url": "https://raw.githubusercontent.com/radixark/miles/366f614b8ba3904984d431291dd396be48ae1aed/miles/utils/distributed_utils.py",
+    "sha256": "13a688b49217b7655fedaed5fea7bd6559939a0a9e134c6b0dedfe1f38e0aecf"
+  },
+  "sglang/python/sglang/srt/utils/common.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/5a8da8cc3fc1ebb5a308f1d1283e2fdf687ee220/python/sglang/srt/utils/common.py",
+    "sha256": "af6d1947eb97f8f4a252ad638e09cf0eb46d405c608e2f9d2a9113605a35723a"
+  }
+}
