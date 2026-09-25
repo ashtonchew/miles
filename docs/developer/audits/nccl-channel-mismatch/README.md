@@ -111,3 +111,22 @@ scoped to deterministic multi-GPU serving with distributed weight transfer.
 Explicit conflicting overrides need a clear error. Copying every serving NCCL
 setting into training would change unrelated reductions. This draft supplies the
 reproduction for reviewing that policy; it does not change runtime defaults.
+
+## Launch policy
+
+Miles resolves a shared channel count before constructing worker launch specs for managed CUDA broadcast transfers. If a weight-receiving engine uses deterministic inference with TP greater than one, the actor trainer and every participating CUDA engine receive matching `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS`. This includes TP1 receivers in a mixed deployment. The count comes from SGLang's `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` setting, including its installed default.
+
+Set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment to choose another count. Explicit incompatible NCCL channel overrides raise a startup error with the expected value. Trainer-specific environment values retain their existing precedence over inherited values. Worker-specific overrides are checked again when the launch environment is built. The resolved policy stays in the spec for worker restarts.
+
+The policy preserves `NCCL_ALGO`. It affects the actor's other NCCL collectives as well as weight transfer, so training collective performance should be measured before deployment. Frozen models, placeholder groups, and critics receive no policy override. Colocated IPC, disk-delta, P2P, ROCm, debug-only runs, and external serving retain their existing behavior. External servers require channel settings to be coordinated by their operator. Older SGLang versions without the deterministic channel setting retain their existing behavior.
+
+## Launch-policy regression checks
+
+The focused suite passes 32 tests locally, covering mixed TP sizes, per-group overrides, configured counts, explicit conflicts, unaffected modes, environment preservation, restart reuse, and the complete launch entrypoint with serving factories isolated. Replacing only `entrypoint.py` with the pre-fix version makes the launch regression fail with `KeyError: 'NCCL_MIN_NCHANNELS'`; restoring the patch passes.
+
+```sh
+PYTHONPATH=. python -m pytest --confcutdir=tests/fast/ray/specs -o addopts='' \
+  tests/fast/ray/specs/test_weight_update_env.py -q
+```
+
+A second entrypoint regression uses the full repository fixtures in `tests/fast/ray/specs/test_entrypoint.py`. That test requires the serving dependencies and was added for CI; it was not run locally. The earlier GPU matrix and HTTP sessions above establish the behavior of matching channel limits. The new automatic launch policy still needs a Ray-launched GPU run, exact server readback, and a training-collective performance measurement.
