@@ -96,13 +96,10 @@ def _worker_env(ctx, *, original, required: dict[str, str], role: str) -> dict[s
 
 def apply_weight_update_env(specs, environments: dict[str, dict[str, str]]):
     """Keep the resolved policy in each launch spec, including restarted workers."""
-    return [
-        (
-            spec.model_copy(
-                update={"env_var": partial(_worker_env, original=spec.env_var, required=required, role=spec.name)}
-            )
-            if (required := environments.get(spec.name))
-            else spec
-        )
-        for spec in specs
-    ]
+    updated = []
+    for spec in specs:
+        if required := environments.get(spec.name):
+            env_var = partial(_worker_env, original=spec.env_var, required=required, role=spec.name)
+            spec = spec.model_copy(update={"env_var": env_var})
+        updated.append(spec)
+    return updated

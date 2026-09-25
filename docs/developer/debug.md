@@ -58,6 +58,16 @@ token, so the ratio stays high when the sync is correct.
 | `--debug-disable-optimizer` | Optimizer and LR-scheduler construction, and the optimizer step. Rollout, log-prob forward and actor forward/backward still run, so this isolates optimizer-state memory and update behavior from the rest. |
 | `--debug-exit-after-rollout <n>` | Everything after rollout `n`. Built for exercising checkpoint resume with consistent scheduler state. |
 
+## NCCL channel mismatch during weight updates
+
+Deterministic CUDA serving with TP greater than one pins NCCL channel limits. Different limits on the trainer and serving ranks can cause a bootstrap error such as `Message truncated : received 6144 bytes instead of 2048` during a weight update.
+
+For managed broadcast transfers, Miles reads SGLang's `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` setting before worker launch and applies matching `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` to the actor and all participating CUDA engines, including TP1 receivers. Per-engine overrides and implicit deterministic modes are included. Worker restarts reuse the resolved settings.
+
+To choose a count, set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment. Remove conflicting NCCL channel overrides or set them to the same value. Trainer-specific overrides take precedence over inherited values; Miles rejects effective values that conflict with serving and checks worker-specific overrides when constructing the launch environment.
+
+`NCCL_ALGO` keeps its existing value. Channel pinning also affects the actor's training collectives, so measure their performance for your workload. Frozen models, critics, and placeholder groups receive no override. Colocated IPC, disk-delta, P2P, ROCm, debug-only runs, skipped weight updates, and older SGLang versions without the channel setting keep their existing behavior. For external serving, coordinate the channel settings before starting the trainer and servers.
+
 ## Make two runs comparable
 
 `--debug-deterministic-collective` runs the training world on the `det_nccl` backend from
