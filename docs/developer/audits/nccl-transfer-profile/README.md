@@ -105,7 +105,7 @@ case, repeated fresh-process results, TP1/nondeterministic controls, and a real
 Miles weight-transfer smoke. Until then, keep the reproduction on the fork and
 avoid claiming that a source-only environment test proves a transport fix.
 
-## Proposed paid phase (not approved)
+## Paid phase (approved and completed)
 
 Use the experiment's base image pinned to
 `radixark/miles@sha256:9d01662b9bf3361ac68b57211a2fcb3b6fef63ba9e4f2da01a2758bbe08d2279`.
@@ -132,3 +132,26 @@ Only after explicit phase approval, add `--approve-paid`. It starts one containe
 runs the matrix twice, and saves the receipts and NCCL logs as a local archive.
 It does not mount experiment volumes or credentials. The launcher has been
 checked locally; cloud execution remains unverified.
+
+## GPU result — 2026-09-25
+
+The user approved the $15 phase. App `ap-s9MnECNEuSVjlCf7wALSEq` completed and
+is stopped. Both matrix repetitions completed. Channel-only and combined cases
+failed with the exact `received 6144 bytes instead of 2048` error; baseline,
+algorithm-only and matched cases passed, totaling 648 exact rank-level checks.
+The failing sender negotiated 24 collective channels and the receivers eight.
+Matched settings negotiated eight on all ranks.
+
+Runtime: H200, PyTorch 2.13.0+cu130, CUDA 13.0, linked NCCL 2.29.7. The image's
+NCCL_VERSION label was stale (2.28.3-1); use the linked runtime version.
+The topology command failed, which is recorded as a limitation.
+
+The public report and reproduction are in [Miles draft #3709](https://github.com/radixark/miles/pull/3709).
+Raw receipts and logs are retained in the adjacent `nccl-diagnostic-artifacts/2026-09-25`
+directory. No model weights were loaded and no optimizer updates occurred.
+
+Budget accounting: app lifetime was 412 seconds, including image import. Reserving
+GPU, eight CPU cores and 32 GiB for that entire interval gives about $2.15, which
+overcounts GPU runtime. With a $3 build/control allowance, reserve $6 total
+against the $15 approval. This is a conservative resource estimate, not an invoice.
+No additional paid runs were started.
