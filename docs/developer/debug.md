@@ -60,13 +60,11 @@ token, so the ratio stays high when the sync is correct.
 
 ## NCCL channel mismatch during weight updates
 
-Deterministic CUDA serving with TP greater than one pins NCCL channel limits. Different limits on the trainer and serving ranks can cause a bootstrap error such as `Message truncated : received 6144 bytes instead of 2048` during a weight update.
+For managed CUDA broadcast transfers with deterministic TP serving, Miles automatically matches the trainer and serving NCCL channel limits. No extra flags are needed.
 
-For managed broadcast transfers, Miles reads SGLang's `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` setting before worker launch and applies matching `NCCL_MIN_NCHANNELS` and `NCCL_MAX_NCHANNELS` to the actor and all participating CUDA engines, including TP1 receivers. Per-engine overrides and implicit deterministic modes are included. Worker restarts reuse the resolved settings.
+If startup reports a conflicting `NCCL_MIN_NCHANNELS` or `NCCL_MAX_NCHANNELS`, remove that override from the job environment or `--train-env-vars`, or match the value shown in the error. To choose a different shared count, set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment before workers start. Trainer channel limits also affect training collectives.
 
-To choose a count, set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment. Remove conflicting NCCL channel overrides or set them to the same value. Trainer-specific overrides take precedence over inherited values; Miles rejects effective values that conflict with serving and checks worker-specific overrides when constructing the launch environment.
-
-`NCCL_ALGO` keeps its existing value. Channel pinning also affects the actor's training collectives, so measure their performance for your workload. Frozen models, critics, and placeholder groups receive no override. Colocated IPC, disk-delta, P2P, ROCm, debug-only runs, skipped weight updates, and older SGLang versions without the channel setting keep their existing behavior. For external serving, coordinate the channel settings before starting the trainer and servers.
+External serving requires you to coordinate channel limits before starting both sides. `NCCL_ALGO` remains unchanged.
 
 ## Make two runs comparable
 
