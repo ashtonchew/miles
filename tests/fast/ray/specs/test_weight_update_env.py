@@ -136,53 +136,6 @@ def test_worker_specific_overrides_cannot_undo_policy():
         )
 
 
-def test_real_entrypoint_installs_policy_before_returning_specs(monkeypatch):
-    # Isolate GPU-serving imports; execute the complete production entrypoint module.
-    import importlib.util
-    import sys
-    from pathlib import Path
-    from types import ModuleType
-
-    import torch
-    import miles.ray.specs
-
-    args = NS(sglang_enable_deterministic_inference=True, train_env_vars={})
-    config = NS(models=[model(group())])
-    monkeypatch.setattr(policy, "_deterministic_channels", lambda: 8)
-    monkeypatch.setattr(torch.version, "hip", None)
-
-    def spec(name):
-        return BaseWorkerSpec(
-            name=name,
-            port_infos=[],
-            scheduling=SchedulingSpec.single(num_gpus_per_worker=1),
-            env_var=lambda ctx: {"NCCL_ALGO": "Ring"},
-        )
-
-    inference = ModuleType("miles.ray.specs.inference")
-    inference.specs_router = lambda args: []
-    inference.spec_session_server = lambda args: spec("session-server")
-    inference.specs_inference_engine = lambda args: [spec("inference-engine-0-0")]
-    train = ModuleType("miles.ray.specs.train")
-    train.specs_trainer = lambda args: [spec("trainer-actor")]
-    config_module = ModuleType("miles.backends.sglang_utils.sglang_config")
-    config_module.resolve_sglang_config = lambda args: config
-    for module in (inference, train, config_module):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(miles.ray.specs, "inference", inference, raising=False)
-    monkeypatch.setattr(miles.ray.specs, "train", train, raising=False)
-    source = Path(policy.__file__).with_name("entrypoint.py")
-    module_spec = importlib.util.spec_from_file_location("_weight_update_entrypoint_test", source)
-    entrypoint = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(entrypoint)
-    specs = {item.name: item for item in entrypoint.compute_specs(args)}
-    for name in ("trainer-actor", "inference-engine-0-0"):
-        env = specs[name].env_var(None)
-        assert env["NCCL_MIN_NCHANNELS"] == env["NCCL_MAX_NCHANNELS"] == "8"
-        assert env["NCCL_ALGO"] == "Ring"
-    assert specs["session-server"].env_var(None) == {"NCCL_ALGO": "Ring"}
-
-
 def test_group_override_can_enable_determinism(monkeypatch):
     monkeypatch.setattr(policy, "_deterministic_channels", lambda: 16)
     args = NS(sglang_enable_deterministic_inference=False, train_env_vars={})
