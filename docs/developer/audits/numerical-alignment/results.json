@@ -1,0 +1,63 @@
+{
+  "scope": "CPU source audit, not distributed or model parity verification",
+  "bridge": {
+    "omitted_fields": [
+      "apply_rope_fusion",
+      "batch_invariant_mode",
+      "true_on_policy_contract",
+      "bias_swiglu_fusion -> bias_activation_fusion"
+    ],
+    "guard": "--true-on-policy-mode is not supported on the megatron backend with this Megatron version; support lands in a follow-up PR. Use --train-backend fsdp for true-on-policy.",
+    "initializer_activation_present": false
+  },
+  "rmsnorm_backward": [
+    {
+      "unit_weight": false,
+      "input_gradient_error": 0.7007681131362915,
+      "corrected_error": 1.1920928955078125e-07
+    },
+    {
+      "unit_weight": true,
+      "input_gradient_error": 5.960464477539063e-08,
+      "corrected_error": 2.384185791015625e-07
+    }
+  ],
+  "nccl": {
+    "trainer_inherited": {
+      "NCCL_ALGO": "Ring"
+    },
+    "serving_after_handler": {
+      "NCCL_ALGO": "allreduce:tree",
+      "NCCL_MIN_NCHANNELS": "8",
+      "NCCL_MAX_NCHANNELS": "8"
+    },
+    "aligned_profile_stable": true,
+    "scope": "Actual handler/environment-builder execution with external config helpers mocked; no NCCL collective executed"
+  },
+  "residual_miles_dependency": {
+    "different_elements": 400,
+    "max_output_difference": 0.015625,
+    "matches_bf16_then_fp32_references": [
+      true,
+      true
+    ]
+  },
+  "residual_sglang_main": {
+    "different_elements": 0,
+    "max_output_difference": 0.0,
+    "matches_bf16_then_fp32_references": [
+      false,
+      true
+    ]
+  },
+  "source_sha256": {
+    "megatron_arguments.py": "c123121c4d0b70f1d556f47407ff7138c7083267b7ac3a4bbd448bca34cc408b",
+    "megatron_batch_invariant.py": "f38dd80fbf7f9c2f3e2d7c390f2d60bb8956632845b5bf159e916c79378ab872",
+    "megatron_initialize.py": "d19ceaab047cbc9dfbf751bf6db151fcd68a35edef3f9d648eb24329d1ff3083",
+    "sglang_attention_hook.py": "f8dbe17da1c928f356ac33d31b2c3427718b1ec52098cdcfadf40acf7292d10b",
+    "sglang_layernorm.py": "cb87d85a89fdd06c5ab2f362e9f06b11dc32a6b5519440805bde038172e4c82b",
+    "sglang_miles_attention_hook.py": "2c14813ce4e3e89034d62b257bd771181d682ef0e27778fd143ed8982e19af72",
+    "sglang_miles_layernorm.py": "8ca2e13e45dad2814e8577d96c9a994e2e5b81130376b8e4f54066ff441bc927",
+    "sglang_server_args.py": "1dc6d150bf7c4ef5c2316c2ce21ca28ea557ac26fcdb150d21ac48fff1a784e6"
+  }
+}

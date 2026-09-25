@@ -1,0 +1,117 @@
+{
+  "passed": 12,
+  "cases": [
+    {
+      "shape": [
+        3,
+        8
+      ],
+      "zero_centered": false,
+      "unit": false,
+      "dx_max_abs_error": 2.384185791015625e-07
+    },
+    {
+      "shape": [
+        3,
+        8
+      ],
+      "zero_centered": false,
+      "unit": true,
+      "dx_max_abs_error": 1.1920928955078125e-07
+    },
+    {
+      "shape": [
+        3,
+        8
+      ],
+      "zero_centered": true,
+      "unit": false,
+      "dx_max_abs_error": 4.76837158203125e-07
+    },
+    {
+      "shape": [
+        3,
+        8
+      ],
+      "zero_centered": true,
+      "unit": true,
+      "dx_max_abs_error": 2.384185791015625e-07
+    },
+    {
+      "shape": [
+        2,
+        3,
+        16
+      ],
+      "zero_centered": false,
+      "unit": false,
+      "dx_max_abs_error": 2.384185791015625e-07
+    },
+    {
+      "shape": [
+        2,
+        3,
+        16
+      ],
+      "zero_centered": false,
+      "unit": true,
+      "dx_max_abs_error": 1.1920928955078125e-07
+    },
+    {
+      "shape": [
+        2,
+        3,
+        16
+      ],
+      "zero_centered": true,
+      "unit": false,
+      "dx_max_abs_error": 2.384185791015625e-07
+    },
+    {
+      "shape": [
+        2,
+        3,
+        16
+      ],
+      "zero_centered": true,
+      "unit": true,
+      "dx_max_abs_error": 2.384185791015625e-07
+    },
+    {
+      "shape": [
+        4,
+        128
+      ],
+      "zero_centered": false,
+      "unit": false,
+      "dx_max_abs_error": 9.5367431640625e-07
+    },
+    {
+      "shape": [
+        4,
+        128
+      ],
+      "zero_centered": false,
+      "unit": true,
+      "dx_max_abs_error": 1.1920928955078125e-07
+    },
+    {
+      "shape": [
+        4,
+        128
+      ],
+      "zero_centered": true,
+      "unit": false,
+      "dx_max_abs_error": 9.5367431640625e-07
+    },
+    {
+      "shape": [
+        4,
+        128
+      ],
+      "zero_centered": true,
+      "unit": true,
+      "dx_max_abs_error": 2.384185791015625e-07
+    }
+  ]
+}

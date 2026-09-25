@@ -1,0 +1,7 @@
+--- a/megatron/core/transformer/custom_layers/batch_invariant_kernels.py
++++ b/megatron/core/transformer/custom_layers/batch_invariant_kernels.py
+@@ -931,3 +931,3 @@
+         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
+-        dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
++        dx = go_fp32 * (w_fp32 * r) - r3 * (s * x_fp32) / D
+         dx = dx.to(x.dtype)

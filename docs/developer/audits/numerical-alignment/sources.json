@@ -1,0 +1,34 @@
+{
+  "megatron_batch_invariant.py": {
+    "url": "https://raw.githubusercontent.com/radixark/Megatron-LM/f148a32b4385b758b66a77c9c3ad1641f1295d4b/megatron/core/transformer/custom_layers/batch_invariant_kernels.py",
+    "sha256": "f38dd80fbf7f9c2f3e2d7c390f2d60bb8956632845b5bf159e916c79378ab872"
+  },
+  "megatron_arguments.py": {
+    "url": "https://raw.githubusercontent.com/radixark/Megatron-LM/f148a32b4385b758b66a77c9c3ad1641f1295d4b/megatron/training/arguments.py",
+    "sha256": "c123121c4d0b70f1d556f47407ff7138c7083267b7ac3a4bbd448bca34cc408b"
+  },
+  "megatron_initialize.py": {
+    "url": "https://raw.githubusercontent.com/radixark/Megatron-LM/f148a32b4385b758b66a77c9c3ad1641f1295d4b/megatron/training/initialize.py",
+    "sha256": "d19ceaab047cbc9dfbf751bf6db151fcd68a35edef3f9d648eb24329d1ff3083"
+  },
+  "sglang_layernorm.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/31b931edc358c0ec01119a3a55952c1ea334a00e/python/sglang/srt/layers/layernorm.py",
+    "sha256": "cb87d85a89fdd06c5ab2f362e9f06b11dc32a6b5519440805bde038172e4c82b"
+  },
+  "sglang_miles_layernorm.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/880e3d2453eb7ef1738350e8c35ba2b956cc93a9/python/sglang/srt/layers/layernorm.py",
+    "sha256": "8ca2e13e45dad2814e8577d96c9a994e2e5b81130376b8e4f54066ff441bc927"
+  },
+  "sglang_attention_hook.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/31b931edc358c0ec01119a3a55952c1ea334a00e/python/sglang/srt/arg_groups/attention_hook.py",
+    "sha256": "f8dbe17da1c928f356ac33d31b2c3427718b1ec52098cdcfadf40acf7292d10b"
+  },
+  "sglang_miles_attention_hook.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/880e3d2453eb7ef1738350e8c35ba2b956cc93a9/python/sglang/srt/arg_groups/attention_hook.py",
+    "sha256": "2c14813ce4e3e89034d62b257bd771181d682ef0e27778fd143ed8982e19af72"
+  },
+  "sglang_server_args.py": {
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/31b931edc358c0ec01119a3a55952c1ea334a00e/python/sglang/srt/server_args.py",
+    "sha256": "1dc6d150bf7c4ef5c2316c2ce21ca28ea557ac26fcdb150d21ac48fff1a784e6"
+  }
+}
