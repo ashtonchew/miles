@@ -1,0 +1,12 @@
+{
+  "rank": 0,
+  "case": "channels",
+  "stage": "role_tp_allreduce_passed",
+  "checks": 0,
+  "torch": "2.13.0+cu130",
+  "nccl": [
+    2,
+    29,
+    7
+  ]
+}

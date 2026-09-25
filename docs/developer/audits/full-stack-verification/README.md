@@ -55,10 +55,54 @@ venv with normal root fixtures and no `--confcutdir` override. Dependencies were
 installed from requirements.txt and tests/ci/requirements-ci-cpu.txt. This root-
 fixture run took 2.77 seconds, with dependency warnings retained.
 
-The broader `tests/fast` run is still in progress. It has failures outside the
-changed helper; no full-suite pass is claimed yet. The image's source pins differ
-from moving dependency branch heads, which must be considered when interpreting
-those failures.
+The complete `tests/fast` run finished: **9,433 passed, 10 failed, 57 skipped,
+6 xfailed, one collection error** (1,227 seconds). Replacing only the provider
+with upstream base and rerunning the cached failing selection reproduced the
+same ten failures and collection error (695 other tests passed). The exact
+failure identities and messages match; see `cpu-summary.json`.
+
+Six failures are LoRA argument incompatibilities with the pinned SGLang source;
+one lacks `SGLANG_SOURCE_ROOT`; two failures and the collection error require
+Git metadata omitted from the source archive. The remaining port-ownership test
+also fails on base; its root cause was not established. This is not a clean CI
+pass. The image source pins differ from moving dependency branch heads.
+The exact RoPE patch separately passes all nine focused tests with normal root
+fixtures (2.78 seconds), without `--confcutdir`.
+
+## Complete Miles provider entry point
+
+A locally generated two-layer BF16 Qwen3 checkpoint (hidden 256, four heads,
+two KV heads, head dimension 64, vocabulary 128) passes through the real
+`get_model_provider_func(args)()` entry point, including checkpoint config
+loading, runtime overrides, provider finalization and model construction.
+Forward and backward are finite with RoPE fusion disabled and enabled; actual
+fused RoPE calls are zero and four respectively. See `miles-provider-entry.json`.
+This entry-point check uses both patches and is not an output-parity comparison.
+
+## TP2 transfer integration
+
+A four-process direct-import test creates trainer and serving NCCL TP groups
+before the mixed weight-transfer group. With channel limits matched at eight,
+all three transfers pass exact checks on sender and both receivers. Existing
+role-group all-reduces pass. In the mismatched case one serving rank reproduces
+6144-versus-2048 truncation, but another hits a global-rank mapping error in this
+shared-default-world harness. That negative case is confounded; use the separate
+three-rank reproduction for the clean mismatch isolation.
+
+A real SGLang TP2 server then accepted **three complete Miles update sessions**:
+pause, begin, broadcast a noncontiguous BF16 tensor, end, set version, resume.
+The trainer's existing TP2 all-reduce passed, all HTTP update acknowledgements
+reported success, and group teardown completed. Trainer and server both use
+eight channels; their algorithms remain Ring and allreduce:tree respectively.
+The model is generated locally, with no model download. See `http-transfer.json`.
+
+Exact server weight readback was **not verified**: this pinned Qwen3 class has no
+`get_weights_by_name` implementation and its HTTP endpoint returns 400. Earlier
+harness attempts exposed two setup requirements: remove torchrun's agent-store
+setting to match Miles actor rendezvous, and open the required weight-update
+session before broadcasting. The final run uses the actual Miles session and
+transfer helpers. It does not launch the trainer through Ray or test a production
+channel-policy fix.
 
 ## Reproduction scripts
 
@@ -75,7 +119,7 @@ uses `/tmp/results/rope-thd.json`; create `/tmp/results` first. `provider_ab.py`
 expects base and combined provider modules at the temporary paths named in its
 source. All model parameters are generated locally; no checkpoint is downloaded.
 
-Remaining gaps: full-suite completion and baseline classification, complete
-Miles Bridge model-provider entry point, packed-model integration, Ray-launched
+Remaining gaps: a clean full-suite pass on the supported CI dependencies,
+packed-model integration, Ray-launched
 weight updates, full 8B/LoRA/YaRN configuration, optimizer/export/reload, and
 production NCCL configuration policy. Keep these distinct from the checks above.

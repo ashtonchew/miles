@@ -1,0 +1,41 @@
+[
+  {
+    "step": 0,
+    "acknowledgements": [
+      {
+        "success": true,
+        "message": "Succeeded to update parameter online."
+      }
+    ],
+    "readback_verified": false,
+    "readback_limit": "Pinned Qwen3ForCausalLM has no get_weights_by_name method",
+    "elements": 256,
+    "noncontiguous_source": true
+  },
+  {
+    "step": 1,
+    "acknowledgements": [
+      {
+        "success": true,
+        "message": "Succeeded to update parameter online."
+      }
+    ],
+    "readback_verified": false,
+    "readback_limit": "Pinned Qwen3ForCausalLM has no get_weights_by_name method",
+    "elements": 256,
+    "noncontiguous_source": true
+  },
+  {
+    "step": 2,
+    "acknowledgements": [
+      {
+        "success": true,
+        "message": "Succeeded to update parameter online."
+      }
+    ],
+    "readback_verified": false,
+    "readback_limit": "Pinned Qwen3ForCausalLM has no get_weights_by_name method",
+    "elements": 256,
+    "noncontiguous_source": true
+  }
+]

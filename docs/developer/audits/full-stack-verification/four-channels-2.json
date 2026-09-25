@@ -1,0 +1,13 @@
+{
+  "rank": 2,
+  "case": "channels",
+  "stage": "failed",
+  "checks": 0,
+  "torch": "2.13.0+cu130",
+  "nccl": [
+    2,
+    29,
+    7
+  ],
+  "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+}

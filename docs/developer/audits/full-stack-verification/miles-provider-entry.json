@@ -1,0 +1,14 @@
+[
+  {
+    "fusion": false,
+    "kernel_calls": 0,
+    "finite": true,
+    "dtype": "torch.bfloat16"
+  },
+  {
+    "fusion": true,
+    "kernel_calls": 4,
+    "finite": true,
+    "dtype": "torch.bfloat16"
+  }
+]

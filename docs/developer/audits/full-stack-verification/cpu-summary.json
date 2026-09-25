@@ -1,0 +1,141 @@
+{
+  "patched": {
+    "suite": {
+      "name": "pytest",
+      "errors": "1",
+      "failures": "10",
+      "skipped": "63",
+      "tests": "9507",
+      "time": "1226.834",
+      "timestamp": "2026-09-25T19:21:43.338173+00:00",
+      "hostname": "modal"
+    },
+    "failures": [
+      {
+        "test": "::tests.fast.test_ray_launcher_unbuffering",
+        "kind": "error",
+        "message": "collection failure"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_server_args_utils.TestServerArgsToArgv::test_lora_fields_roundtrip",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_server_args_utils.TestServerArgsToArgv::test_lora_adapter_paths_roundtrip",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[single-qkv]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[single-gdn]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[multi-qkv]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[multi-gdn]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.router.test_sglang_anthropic_conversion::test_sglang_anthropic_conversion_contract",
+        "kind": "failure",
+        "message": "KeyError: 'SGLANG_SOURCE_ROOT'"
+      },
+      {
+        "test": "tests.fast.test_docker_image_inputs::test_compute_is_deterministic",
+        "kind": "failure",
+        "message": "subprocess.CalledProcessError: Command '['git', 'ls-files']' returned non-zero exit status 128."
+      },
+      {
+        "test": "tests.fast.test_docker_image_inputs::test_compute_tracks_every_declared_input",
+        "kind": "failure",
+        "message": "subprocess.CalledProcessError: Command '['git', 'ls-files']' returned non-zero exit status 128."
+      },
+      {
+        "test": "tests.fast.utils.api_server.test_server.TestStartApiServerRaw::test_a_port_already_taken_fails_the_caller",
+        "kind": "failure",
+        "message": "Failed: DID NOT RAISE RuntimeError"
+      }
+    ]
+  },
+  "base": {
+    "suite": {
+      "name": "pytest",
+      "errors": "1",
+      "failures": "10",
+      "skipped": "11",
+      "tests": "717",
+      "time": "66.991",
+      "timestamp": "2026-09-25T19:45:35.755547+00:00",
+      "hostname": "modal"
+    },
+    "failures": [
+      {
+        "test": "::tests.fast.test_ray_launcher_unbuffering",
+        "kind": "error",
+        "message": "collection failure"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_server_args_utils.TestServerArgsToArgv::test_lora_fields_roundtrip",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_server_args_utils.TestServerArgsToArgv::test_lora_adapter_paths_roundtrip",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[single-qkv]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[single-gdn]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[multi-qkv]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.backends.sglang_utils.test_sglang_engine.TestLoraTargetModules::test_adapter_selection_reaches_engine_and_sync_config[multi-gdn]",
+        "kind": "failure",
+        "message": "SystemExit: 2"
+      },
+      {
+        "test": "tests.fast.router.test_sglang_anthropic_conversion::test_sglang_anthropic_conversion_contract",
+        "kind": "failure",
+        "message": "KeyError: 'SGLANG_SOURCE_ROOT'"
+      },
+      {
+        "test": "tests.fast.test_docker_image_inputs::test_compute_is_deterministic",
+        "kind": "failure",
+        "message": "subprocess.CalledProcessError: Command '['git', 'ls-files']' returned non-zero exit status 128."
+      },
+      {
+        "test": "tests.fast.test_docker_image_inputs::test_compute_tracks_every_declared_input",
+        "kind": "failure",
+        "message": "subprocess.CalledProcessError: Command '['git', 'ls-files']' returned non-zero exit status 128."
+      },
+      {
+        "test": "tests.fast.utils.api_server.test_server.TestStartApiServerRaw::test_a_port_already_taken_fails_the_caller",
+        "kind": "failure",
+        "message": "Failed: DID NOT RAISE RuntimeError"
+      }
+    ]
+  },
+  "same_failures": true
+}

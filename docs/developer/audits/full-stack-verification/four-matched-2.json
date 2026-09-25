@@ -1,0 +1,12 @@
+{
+  "rank": 2,
+  "case": "matched",
+  "stage": "passed",
+  "checks": 3,
+  "torch": "2.13.0+cu130",
+  "nccl": [
+    2,
+    29,
+    7
+  ]
+}

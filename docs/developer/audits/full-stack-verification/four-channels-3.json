@@ -1,0 +1,13 @@
+{
+  "rank": 3,
+  "case": "channels",
+  "stage": "failed",
+  "checks": 0,
+  "torch": "2.13.0+cu130",
+  "nccl": [
+    2,
+    29,
+    7
+  ],
+  "error": "ValueError('Global rank 3 is not part of group <torch.distributed.distributed_c10d.ProcessGroup object at 0x2ac40dc8f930>')"
+}
