@@ -11,11 +11,10 @@ The original checkout was clean and left on its existing branch. Worktrees:
 
 Read `AGENTS.md`, `.claude/rules/general-code-style.md`,
 `docs/developer/contributor-guide.md` and the actual `pyproject.toml`/pre-commit settings.
-The config specifies Black/isort line length 119 despite the contributor prose saying
-100. Follow the executable config. The repo already tests Bridge helpers by executing
+The current config and contributor guide specify Black/isort line length 119. The repo already tests Bridge helpers by executing
 their AST without importing GPU-only dependencies; the regression follows that seam.
-Do not infer end-to-end CUDA support from these tests. No GPU jobs, model downloads,
-optimizer steps, upstream issues or upstream PRs were initiated by this audit.
+Do not infer end-to-end CUDA support from these tests. No GPU jobs, model downloads or optimizer steps were initiated by this audit.
+The subsequent RoPE draft is [Miles #3708](https://github.com/radixark/miles/pull/3708).
 
 ## Recommendations
 
@@ -60,8 +59,13 @@ Current dependency revisions:
 
 These are branch heads inspected, not proof that an already-published container embeds
 those exact revisions. `sources.json` records immutable URLs and SHA-256 checksums.
-GitHub searches found no RMSNorm-backward issue in radixark/Megatron-LM and no clearly
-matching Bridge-fusion fix in the returned Miles PR results; searches are not exhaustive.
+A broader follow-up search found [NVIDIA/Megatron-LM #6859](https://github.com/NVIDIA/Megatron-LM/pull/6859),
+which already proposes the identical backward fix and the zero-centered forward fix.
+Do not submit a duplicate. Useful follow-up is nonunit-weight regression coverage:
+the existing unit-weight test hides the defect.
+[radixark/Megatron-LM #70](https://github.com/radixark/Megatron-LM/pull/70) is separate
+Qwen3 parity work worth evaluating; its reported configurations do not certify
+our 8B LoRA/64K setup.
 
 ## Reproduce the CPU audit
 
@@ -103,11 +107,11 @@ Bridge bypasses Megatron's ordinary argument-to-config translation. As a result,
 RoPE setting, preserving providers when that argument is absent. Include the failing
 CPU reproducer and green regression; state that no complete GPU parity repair is claimed.
 
-**Megatron: `fix: correct batch-invariant RMSNorm input gradient`**
+**Megatron: support existing PR #6859 with regression coverage**
 For nonunit normalization weights, the backward subtracts a correction multiplied by
-an extra weight. Remove that factor; compare against autograd using nonunit weights
-so the defect cannot be hidden by all-ones initialization. Include the independent
-CPU evidence and request CUDA parity/gradient coverage before merge.
+an extra weight. PR #6859 already removes it. Compare against autograd using nonunit
+weights so the defect cannot be hidden by all-ones initialization. The CPU evidence
+here supports that correction; actual CUDA forward/backward coverage remains needed.
 
 **Miles/SGLang: deterministic TP2 weight-sync environment mismatch**
 Report the actual handler and trainer-builder divergence, with immutable revisions and
@@ -116,3 +120,12 @@ communicator validation should live. Avoid advertising the profile as a universa
 
 Final candidate validation: all repository pre-commit hooks passed on the changed
 production and test files; the 9-test Bridge suite passed after those hooks.
+
+## NCCL follow-up
+
+The `test/nccl-transfer-profile` branch now contains a three-rank synthetic broadcast
+reproducer and source-linked investigation. Five independent profiles separate
+algorithm and channel effects. `allreduce:tree` does not force a Tree broadcast,
+so environment string inequality alone is not a valid transport diagnosis.
+Both current-source and experiment-pinned CPU/Gloo smoke runs pass (540 exact
+rank-level checks each). GPU/NCCL execution awaits a separate phase approval.
