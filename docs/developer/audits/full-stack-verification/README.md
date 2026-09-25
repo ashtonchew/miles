@@ -123,3 +123,29 @@ Remaining gaps: a clean full-suite pass on the supported CI dependencies,
 packed-model integration, Ray-launched
 weight updates, full 8B/LoRA/YaRN configuration, optimizer/export/reload, and
 production NCCL configuration policy. Keep these distinct from the checks above.
+
+For the complete provider entry point, run `create_tiny.py`, then
+`miles_provider_entry.py` with the same `PYTHONPATH`. For the HTTP integration,
+start the generated model on GPUs 2 and 3:
+
+```sh
+CUDA_VISIBLE_DEVICES=2,3 NCCL_MIN_NCHANNELS=8 NCCL_MAX_NCHANNELS=8 \
+NCCL_ALGO=allreduce:tree python -m sglang.launch_server \
+  --model-path /tmp/tiny-qwen3 --tp-size 2 --port 30002 \
+  --skip-tokenizer-init --disable-cuda-graph --disable-radix-cache \
+  --mem-fraction-static 0.3 --context-length 128 \
+  --enable-deterministic-inference --attention-backend fa3 \
+  --disable-custom-all-reduce --disable-overlap-schedule --log-level warning
+```
+
+After `/health` returns 200, run the sender in a separate terminal:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=/path/to/miles:/root/Megatron-LM \
+  timeout 180 python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  tools/debug/full_stack_verification/http_transfer_session.py
+```
+
+Use a fresh server for each attempt. Scripts write receipts under `/tmp/results`;
+create that directory first. The HTTP test asserts successful acknowledgements,
+not readback equality. Stop the server after the test.
