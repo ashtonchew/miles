@@ -1,0 +1,290 @@
+{
+  "runtime": {
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "nccl": [
+      2,
+      29,
+      7
+    ],
+    "gpu": "NVIDIA H200"
+  },
+  "driver": "580.95.05",
+  "gpu_count_allocated": 4,
+  "gpu_count_used": 3,
+  "topology_query": "nvidia-smi topo -m failed; no topology matrix available",
+  "image": "radixark/miles@sha256:9d01662b9bf3361ac68b57211a2fcb3b6fef63ba9e4f2da01a2758bbe08d2279",
+  "archive_sha256": "b513b828b608da3455f96f0e2ef712066f53c077f755a6e2c2df01664abc0871",
+  "cases": [
+    {
+      "repeat": "repeat-0",
+      "case": "algorithm-only",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-0",
+      "case": "baseline",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-0",
+      "case": "channels-only",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "group_initialized",
+          "exact_checks": 0,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        },
+        {
+          "rank": 2,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-0",
+      "case": "combined",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "group_initialized",
+          "exact_checks": 0,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        },
+        {
+          "rank": 2,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-0",
+      "case": "matched",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-1",
+      "case": "algorithm-only",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-1",
+      "case": "baseline",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 24,
+          "error": null
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-1",
+      "case": "channels-only",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "group_initialized",
+          "exact_checks": 0,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        },
+        {
+          "rank": 2,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-1",
+      "case": "combined",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "group_initialized",
+          "exact_checks": 0,
+          "coll_channels": 24,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        },
+        {
+          "rank": 2,
+          "status": "failed",
+          "exact_checks": 0,
+          "coll_channels": 8,
+          "error": "DistBackendError('NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:3866, internal error - please report this issue to the NCCL developers, NCCL version 2.29.7\\nncclInternalError: Internal check failed.\\nLast error:\\nMessage truncated : received 6144 bytes instead of 2048')"
+        }
+      ]
+    },
+    {
+      "repeat": "repeat-1",
+      "case": "matched",
+      "ranks": [
+        {
+          "rank": 0,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 1,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        },
+        {
+          "rank": 2,
+          "status": "passed",
+          "exact_checks": 36,
+          "coll_channels": 8,
+          "error": null
+        }
+      ]
+    }
+  ]
+}
