@@ -1,0 +1,28 @@
+[
+  {
+    "kind": "swiglu",
+    "dtype": "torch.float32",
+    "kernel_calls": [
+      0,
+      2
+    ],
+    "max_output_error": 1.3783574104309082e-05,
+    "max_gradient_error": 7.3661794885993e-07,
+    "atol": 0.0001,
+    "rtol": 0.0001,
+    "passed": true
+  },
+  {
+    "kind": "swiglu",
+    "dtype": "torch.bfloat16",
+    "kernel_calls": [
+      0,
+      2
+    ],
+    "max_output_error": 0.0048828125,
+    "max_gradient_error": 6.103515625e-05,
+    "atol": 0.02,
+    "rtol": 0.02,
+    "passed": true
+  }
+]

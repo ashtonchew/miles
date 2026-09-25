@@ -1,0 +1,14 @@
+[
+  {
+    "source": "base",
+    "rope": true,
+    "swiglu": true,
+    "args_swiglu": false
+  },
+  {
+    "source": "fixed",
+    "rope": false,
+    "swiglu": false,
+    "args_swiglu": false
+  }
+]

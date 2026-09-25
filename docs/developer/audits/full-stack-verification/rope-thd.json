@@ -1,0 +1,26 @@
+[
+  {
+    "dtype": "torch.float32",
+    "calls": [
+      0,
+      1
+    ],
+    "max_output_error": 2.384185791015625e-07,
+    "max_gradient_error": 5.820766091346741e-11,
+    "atol": 1e-05,
+    "rtol": 1e-05,
+    "passed": true
+  },
+  {
+    "dtype": "torch.bfloat16",
+    "calls": [
+      0,
+      1
+    ],
+    "max_output_error": 0.015625,
+    "max_gradient_error": 3.814697265625e-06,
+    "atol": 0.02,
+    "rtol": 0.02,
+    "passed": true
+  }
+]
