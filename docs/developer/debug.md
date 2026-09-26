@@ -60,9 +60,9 @@ token, so the ratio stays high when the sync is correct.
 
 ## NCCL channel mismatch during weight updates
 
-For managed CUDA broadcast transfers with deterministic TP serving, Miles automatically matches the trainer and serving NCCL channel limits. No extra flags are needed.
+For managed CUDA broadcast transfers with deterministic TP serving, Miles matches the trainer’s weight-transfer communicator to the serving NCCL channel count. Training communicators keep their existing settings. No extra flags are needed.
 
-If startup reports a conflicting `NCCL_MIN_NCHANNELS` or `NCCL_MAX_NCHANNELS`, remove that override from the job environment or `--train-env-vars`, or match the value shown in the error. To choose a different shared count, set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment before workers start. Trainer channel limits also affect training collectives.
+If startup reports a conflicting NCCL channel override (including `NCCL_*_NCHANNELS`, `NCCL_*_CTAS`, or the legacy `NCCL_*_NRINGS`), remove that override from the job environment or `--train-env-vars`, or match the value shown in the error. To choose a different shared count, set `SGLANG_DETERMINISTIC_NCCL_NCHANNELS` in the job environment before workers start. Explicit process-wide trainer overrides still affect training collectives.
 
 External serving requires you to coordinate channel limits before starting both sides. `NCCL_ALGO` remains unchanged.
 

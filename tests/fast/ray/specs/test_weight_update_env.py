@@ -2,8 +2,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from miles.backends.training_utils.weight_update.nccl import CHANNEL_ENV_KEYS
 from miles.ray.specs import weight_update_env as policy
-from miles.utils.workers.worker_spec import BaseWorkerSpec, SchedulingSpec, WorkerLaunchContext
+from miles.utils.workers.worker_spec import BaseWorkerSpec, SchedulingSpec, ServeWorkerSpec, WorkerLaunchContext
 
 
 def group(*, tp=2, worker_type="regular", **overrides):
@@ -17,21 +18,33 @@ def model(*groups, update_weights=True):
 def resolve(monkeypatch, *models, hip=False, channels=8, **overrides):
     monkeypatch.setattr(policy, "_deterministic_channels", lambda: channels)
     args = NS(sglang_enable_deterministic_inference=True, train_env_vars={}, **overrides)
-    return policy.resolve_weight_update_env(args, NS(models=list(models)), is_hip=hip)
+    return resolve_policy(args, NS(models=list(models)), is_hip=hip)
+
+
+def resolve_policy(args, config, *, is_hip):
+    return policy.resolve_weight_update_channels(
+        args,
+        config,
+        is_hip=is_hip,
+        trainer_pool_ids=["trainer-engine-actor"],
+        engine_pool_ids={
+            (m, g): f"inference-engine-all-{m}-{g}"
+            for m, model in enumerate(config.models)
+            for g, _ in enumerate(model.server_groups)
+        },
+    )
 
 
 @pytest.fixture(autouse=True)
 def clean_environment(monkeypatch):
-    for key in (*policy._CHANNEL_KEYS, "SGLANG_DETERMINISTIC_NCCL_NCHANNELS"):
+    for key in (*CHANNEL_ENV_KEYS, "SGLANG_DETERMINISTIC_NCCL_NCHANNELS"):
         monkeypatch.delenv(key, raising=False)
 
 
 def test_tp2_and_tp1_receivers_share_the_trainers_policy(monkeypatch):
     result = resolve(monkeypatch, model(group(), group(tp=1)), model(group(), update_weights=False))
-    assert set(result) == {"trainer-actor", "inference-engine-0-0", "inference-engine-0-1"}
-    for env in result.values():
-        assert env["NCCL_MIN_NCHANNELS"] == env["NCCL_MAX_NCHANNELS"] == "8"
-        assert "NCCL_ALGO" not in env
+    assert set(result) == {"trainer-engine-actor", "inference-engine-all-0-0", "inference-engine-all-0-1"}
+    assert set(result.values()) == {8}
 
 
 @pytest.mark.parametrize(
@@ -71,11 +84,11 @@ def test_rocm_keeps_its_existing_policy(monkeypatch):
 
 def test_custom_sglang_count_reaches_both_roles(monkeypatch):
     result = resolve(monkeypatch, model(group()), channels=16)
-    assert result["trainer-actor"]["NCCL_MAX_NCHANNELS"] == "16"
-    assert result["inference-engine-0-0"]["SGLANG_DETERMINISTIC_NCCL_NCHANNELS"] == "16"
+    assert result["trainer-engine-actor"] == 16
+    assert result["inference-engine-all-0-0"] == 16
 
 
-@pytest.mark.parametrize("key", policy._CHANNEL_KEYS)
+@pytest.mark.parametrize("key", CHANNEL_ENV_KEYS)
 def test_inherited_conflicts_fail_before_launch(monkeypatch, key):
     monkeypatch.setenv(key, "24")
     with pytest.raises(ValueError, match=f"{key}=24"):
@@ -86,13 +99,13 @@ def test_explicit_trainer_conflict_fails(monkeypatch):
     monkeypatch.setattr(policy, "_deterministic_channels", lambda: 8)
     args = NS(sglang_enable_deterministic_inference=True, train_env_vars={"NCCL_MIN_NCHANNELS": "24"})
     with pytest.raises(ValueError, match="trainer sets NCCL_MIN_NCHANNELS=24"):
-        policy.resolve_weight_update_env(args, NS(models=[model(group())]), is_hip=False)
+        resolve_policy(args, NS(models=[model(group())]), is_hip=False)
 
 
 def test_matching_explicit_values_are_accepted(monkeypatch):
-    for key in policy._CHANNEL_KEYS:
+    for key in CHANNEL_ENV_KEYS:
         monkeypatch.setenv(key, "8")
-    assert resolve(monkeypatch, model(group()))["trainer-actor"]["NCCL_MIN_NCHANNELS"] == "8"
+    assert resolve(monkeypatch, model(group()))["trainer-engine-actor"] == 8
 
 
 @pytest.mark.parametrize("count", [0, -1])
@@ -107,22 +120,43 @@ def test_older_sglang_without_channel_policy_is_unchanged(monkeypatch):
 
 def test_worker_specs_preserve_other_environment_and_restarts(monkeypatch):
     original_env = {"NCCL_ALGO": "Ring", "OTHER": "value"}
+    original_args = NS(existing="value")
+    original_kwargs = {"args": original_args, "rank": 0}
     specs = [
-        BaseWorkerSpec(
-            name=name,
+        ServeWorkerSpec(
+            name="trainer-engine-actor",
             port_infos=[],
             scheduling=SchedulingSpec.single(num_gpus_per_worker=1),
             env_var=lambda ctx: original_env,
-        )
-        for name in ["trainer-actor", "trainer-critic", "inference-engine-0-0", "session-server"]
+            worker_class="test.Actor",
+            ctor_kwargs=lambda ctx: original_kwargs,
+        ),
+        *[
+            BaseWorkerSpec(
+                name=name,
+                port_infos=[],
+                scheduling=SchedulingSpec.single(num_gpus_per_worker=1),
+                env_var=lambda ctx: original_env,
+            )
+            for name in ["trainer-engine-critic", "inference-engine-all-0-0", "session-server"]
+        ],
     ]
-    envs = resolve(monkeypatch, model(group()))
-    updated = policy.apply_weight_update_env(specs, envs)
+    updated = policy.apply_weight_update_channels(specs, resolve(monkeypatch, model(group())))
     ctx = WorkerLaunchContext(cell_index=0, worker_in_cell_index=0, gpu_ids=[0])
     for _ in range(2):
-        assert updated[0].env_var(ctx) == {**original_env, **envs["trainer-actor"]}
-        assert updated[2].env_var(ctx) == {**original_env, **envs["inference-engine-0-0"]}
+        assert updated[0].env_var(ctx) == original_env
+        kwargs = updated[0].ctor_kwargs(ctx)
+        assert kwargs["args"]._weight_update_nccl_channels == 8
+        assert kwargs["args"].existing == "value" and kwargs["rank"] == 0
+        assert kwargs["args"] is not original_args
+        assert updated[2].env_var(ctx) == {
+            **original_env,
+            "NCCL_MIN_NCHANNELS": "8",
+            "NCCL_MAX_NCHANNELS": "8",
+            "SGLANG_DETERMINISTIC_NCCL_NCHANNELS": "8",
+        }
     assert updated[1] is specs[1] and updated[3] is specs[3]
+    assert not hasattr(original_args, "_weight_update_nccl_channels")
     assert original_env == {"NCCL_ALGO": "Ring", "OTHER": "value"}
 
 
@@ -131,7 +165,7 @@ def test_worker_specific_overrides_cannot_undo_policy():
         policy._worker_env(
             None,
             original=lambda ctx: {"NCCL_MAX_NCHANNELS": "24"},
-            required={"NCCL_MAX_NCHANNELS": "8"},
+            channels=8,
             role="serving",
         )
 
@@ -140,7 +174,7 @@ def test_group_override_can_enable_determinism(monkeypatch):
     monkeypatch.setattr(policy, "_deterministic_channels", lambda: 16)
     args = NS(sglang_enable_deterministic_inference=False, train_env_vars={})
     config = NS(models=[model(group(enable_deterministic_inference=True))])
-    assert policy.resolve_weight_update_env(args, config, is_hip=False)["trainer-actor"]["NCCL_MIN_NCHANNELS"] == "16"
+    assert resolve_policy(args, config, is_hip=False)["trainer-engine-actor"] == 16
 
 
 def test_sglang_setting_supplies_its_own_default(monkeypatch):
@@ -167,8 +201,25 @@ def test_implied_deterministic_modes_are_resolved(monkeypatch, name, value):
     monkeypatch.setattr(policy, "_deterministic_channels", lambda: 8)
     args = NS(sglang_enable_deterministic_inference=False, train_env_vars={})
     config = NS(models=[model(group(**{name: value}))])
-    assert "trainer-actor" in policy.resolve_weight_update_env(args, config, is_hip=False)
+    assert "trainer-engine-actor" in resolve_policy(args, config, is_hip=False)
 
 
 def test_skipped_weight_updates_keep_existing_environment(monkeypatch):
     assert resolve(monkeypatch, model(group()), debug_skip_weight_update=True) == {}
+
+
+def test_named_deployment_pool_ids_are_preserved(monkeypatch):
+    monkeypatch.setattr(policy, "_deterministic_channels", lambda: 8)
+    args = NS(sglang_enable_deterministic_inference=True, train_env_vars={})
+    result = policy.resolve_weight_update_channels(
+        args,
+        NS(models=[model(group())]),
+        is_hip=False,
+        trainer_pool_ids=["trainer-engine-policy-a-actor", "trainer-engine-policy-b-actor"],
+        engine_pool_ids={(0, 0): "inference-engine-custom-release-0-0"},
+    )
+    assert result == {
+        "trainer-engine-policy-a-actor": 8,
+        "trainer-engine-policy-b-actor": 8,
+        "inference-engine-custom-release-0-0": 8,
+    }

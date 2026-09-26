@@ -261,6 +261,8 @@ class TestDeployComponentFiltering:
         specs = compute_specs(self._args(tmp_path, deploy_component=component))
 
         assert "inference-registration-reporter" not in [spec.name for spec in specs]
+
+
 def test_deterministic_weight_transfer_env_is_installed_before_worker_launch(monkeypatch):
     from miles.utils.workers.worker_spec import WorkerLaunchContext
 
@@ -277,6 +279,10 @@ def test_deterministic_weight_transfer_env_is_installed_before_worker_launch(mon
     )
     specs = {spec.name: spec for spec in compute_specs(args)}
     ctx = WorkerLaunchContext(cell_index=0, worker_in_cell_index=0, gpu_ids=[0])
-    for name in ("trainer-actor", "inference-engine-0-0"):
-        env = specs[name].env_var(ctx)
-        assert env["NCCL_MIN_NCHANNELS"] == env["NCCL_MAX_NCHANNELS"] == "8"
+    trainer = specs["trainer-engine-actor"]
+    assert "NCCL_MIN_NCHANNELS" not in trainer.env_var(ctx)
+    assert "NCCL_MAX_NCHANNELS" not in trainer.env_var(ctx)
+    assert trainer.ctor_kwargs(ctx)["args"]._weight_update_nccl_channels == 8
+    assert not hasattr(args, "_weight_update_nccl_channels")
+    env = specs["inference-engine-all-0-0"].env_var(ctx)
+    assert env["NCCL_MIN_NCHANNELS"] == env["NCCL_MAX_NCHANNELS"] == "8"
